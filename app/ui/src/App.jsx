@@ -9,6 +9,7 @@ import { resamplePcmTo16k, createLevelMonitor } from './lib/audio.js';
 import { verifiedAddModule } from './lib/asset-integrity.js';
 import { createLiveTranscriber } from './lib/liveTranscriber.js';
 import { acquireKeepalive, releaseKeepalive } from './lib/keepalive.js';
+import { createVadAsrWorkerClient } from './lib/vadAsrWorkerClient.js';
 import { MicVAD } from '@ricky0123/vad-web';
 import vadOrtWasmThreadedMjsUrl from '../vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs?url';
 import vadOrtWasmThreadedWasmUrl from '../vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm?url';
@@ -40,6 +41,53 @@ const VAD_POSITIVE_SPEECH_THRESHOLD = 0.3;
 const VAD_NEGATIVE_SPEECH_THRESHOLD = 0.25;
 const VAD_REDEMPTION_MS = 1400;
 const VAD_HANDOFF_PENDING_MS = 100;
+const DEFAULT_VAD_CPU_THREADS = 1;
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function supportsWebGpuHybrid() {
+  return typeof navigator !== 'undefined' && 'gpu' in navigator;
+}
+
+function getPreferredBackend() {
+  return 'wasm';
+}
+
+function sanitizeBackend(value, fallback = getPreferredBackend()) {
+  if (value === 'wasm') return 'wasm';
+  if (value === 'webgpu-hybrid') {
+    return supportsWebGpuHybrid() ? value : 'wasm';
+  }
+  return fallback;
+}
+
+function getDefaultCpuThreads(maxCores) {
+  return clampNumber(maxCores - 2, 1, 4);
+}
+
+function sanitizeCpuThreads(value, maxCores, fallback = getDefaultCpuThreads(maxCores)) {
+  const requested = Number(value);
+  if (!Number.isFinite(requested)) return fallback;
+  return clampNumber(Math.round(requested), 1, maxCores);
+}
+
+// Pre-issue-3 builds auto-persisted "hardware cores minus 2" even when the
+// user never touched the field. Migrate just that legacy default downward so
+// upgraded profiles pick up the lower-CPU baseline automatically.
+function shouldMigrateLegacyCpuThreads(value, maxCores) {
+  const legacyDefault = Math.max(1, maxCores - 2);
+  return value === legacyDefault && legacyDefault > getDefaultCpuThreads(maxCores);
+}
+
+// Issue #3 briefly auto-persisted `webgpu-hybrid` as the default backend before
+// the heavier startup path was validated. Roll those implicit profiles back to
+// WASM, but preserve future explicit WebGPU selections with a dedicated flag.
+function shouldRollbackLegacyBackend(value, explicit) {
+  return explicit !== true && value === 'webgpu-hybrid';
+}
+
 async function getDictationLib() {
   if (!_dictationLib && dictationEnabled) {
     // The vendored dictation_support is a UMD bundle. Vite/Rollup treats it as
@@ -204,12 +252,13 @@ async function saveSetting(key, value) {
 async function loadPersistedTranscripts() {
   try {
     const fromOwn = await idbGet(await getTranscriptsDb(), TRANSCRIPTS_STORE_NAME, TRANSCRIPTS_KEY);
-    if (Array.isArray(fromOwn)) return fromOwn;
+    if (Array.isArray(fromOwn)) return fromOwn.map(hydratePersistedTranscript);
     const legacy = await idbGet(await getSettingsDb(), SETTINGS_STORE_NAME, STORAGE_KEY_PREFIX + 'transcriptions');
     if (Array.isArray(legacy) && legacy.length > 0) {
-      await saveTranscripts(legacy);
+      const hydratedLegacy = legacy.map(hydratePersistedTranscript);
+      await saveTranscripts(hydratedLegacy);
       await idbDelete(await getSettingsDb(), SETTINGS_STORE_NAME, STORAGE_KEY_PREFIX + 'transcriptions');
-      return legacy;
+      return hydratedLegacy;
     }
     return [];
   } catch (e) {
@@ -218,13 +267,49 @@ async function loadPersistedTranscripts() {
   }
 }
 
-// F-130: persist only the minimum the history UI needs to render on reload
-// (id, text, timestamp, wordCount). filename, words[] (per-word confidences
-// and start/end timestamps), metrics, and duration stay in-memory and are
-// re-derived/absent on reload. Narrows the on-disk record so a LevelDB
-// recovery cannot reconstruct the audio fingerprint of the original recording
-// (per-word timings, file name that may itself carry PHI like a patient
-// identifier) beyond the text content the user explicitly opted into saving.
+function countWordsFromText(text) {
+  const trimmed = String(text ?? '').trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
+function normalizeMergedTranscriptText(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function generateSessionId(prefix) {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function hydratePersistedTranscript(t) {
+  if (!t || typeof t !== 'object') return t;
+  const createdAtMs = Number.isFinite(Number(t.createdAtMs))
+    ? Number(t.createdAtMs)
+    : (Number.isFinite(Number(t.id)) ? Number(t.id) : Date.now());
+  return {
+    id: t.id ?? generateSessionId('trans'),
+    text: typeof t.text === 'string' ? t.text : '',
+    timestamp: t.timestamp || new Date(createdAtMs).toLocaleTimeString(),
+    createdAtMs,
+    wordCount: Number.isFinite(Number(t.wordCount)) ? Number(t.wordCount) : countWordsFromText(t.text),
+    source: typeof t.source === 'string' ? t.source : 'history',
+    mergedCount: Number.isFinite(Number(t.mergedCount)) ? Number(t.mergedCount) : null,
+    filename: typeof t.filename === 'string' ? t.filename : '',
+    duration: Number.isFinite(Number(t.duration)) ? Number(t.duration) : null,
+    confidence: t.confidence ?? null,
+    metrics: t.metrics ?? null,
+    words: Array.isArray(t.words) ? t.words : [],
+    audioClips: Array.isArray(t.audioClips) ? t.audioClips.filter(Boolean) : [],
+    linkedQueueId: typeof t.linkedQueueId === 'string' ? t.linkedQueueId : null,
+  };
+}
+
+// F-130: persist only the minimum the review/history UI needs to render on
+// reload. filename, audioClips, words[] (per-word confidences and timestamps),
+// metrics, and duration stay in-memory only. This keeps review metadata intact
+// while still not persisting session audio or richer audio-derived details.
 function slimTranscriptForPersist(t) {
   if (!t || typeof t !== 'object') return t;
   return {
@@ -232,6 +317,9 @@ function slimTranscriptForPersist(t) {
     text: t.text,
     timestamp: t.timestamp,
     wordCount: t.wordCount,
+    createdAtMs: t.createdAtMs,
+    source: t.source,
+    mergedCount: t.mergedCount ?? null,
   };
 }
 
@@ -346,6 +434,9 @@ function truncateFilename(filename, maxLength = 40) {
 export default function App() {
   const { t } = useI18n();
   const repoId = CONFIG.VITE_MODEL_REPO || 'istupakov/parakeet-tdt-0.6b-v3-onnx';
+  const maxCores = Math.max(1, navigator.hardwareConcurrency || 8);
+  const defaultBackend = getPreferredBackend();
+  const defaultCpuThreads = getDefaultCpuThreads(maxCores);
   // Where model weights are served from:
   //   'hf'    : HuggingFace only (default)
   //   'local' : instance-served /models/ only (skip HF entirely)
@@ -356,7 +447,8 @@ export default function App() {
   const localFallbackEnabled = modelSource === 'local' || modelSource === 'both';
   // Warning message when local fallback is enabled but model files are missing
   const [fallbackWarning, setFallbackWarning] = useState(null);
-  const [backend, setBackend] = useState('wasm');
+  const [backend, setBackend] = useState(defaultBackend);
+  const [backendExplicit, setBackendExplicit] = useState(false);
   const [memoryInfo, setMemoryInfo] = useState(null);
   const [, startTransition] = useTransition();
   const [preprocessor, setPreprocessor] = useState('nemo128');
@@ -367,8 +459,16 @@ export default function App() {
   const [text, setText] = useState('');
   const [latestMetrics, setLatestMetrics] = useState(null);
   const [transcriptions, setTranscriptions] = useState([]);
+  const [activePage, setActivePage] = useState('record');
+  const [selectedReviewIds, setSelectedReviewIds] = useState([]);
+  const [editingReviewId, setEditingReviewId] = useState(null);
+  const [editingReviewDraft, setEditingReviewDraft] = useState('');
+  const [pendingDeleteReviewId, setPendingDeleteReviewId] = useState(null);
   // Track the most recently added transcription ID for fade-in animation
   const newestTranscriptionIdRef = useRef(null);
+  const reviewAudioSeqRef = useRef(0);
+  const reviewAudioUrlsRef = useRef(new Map());
+  const pendingReviewContextRef = useRef(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [verboseLog, setVerboseLog] = useState(false);
   const [frameStride, setFrameStride] = useState(1);
@@ -393,9 +493,12 @@ export default function App() {
   // built once per session) read the latest user setting.
   const liveTranscriptionEnabledRef = useRef(false);
   const liveContextWindowRef = useRef('auto');
-  const maxCores = navigator.hardwareConcurrency || 8;
-  // Default to all available CPU cores for best transcription throughput
-  const [cpuThreads, setCpuThreads] = useState(maxCores);
+  // Default to a modest thread cap so the browser stays responsive while
+  // Parakeet and Silero VAD share the same machine.
+  const [cpuThreads, setCpuThreads] = useState(defaultCpuThreads);
+  const effectiveBackend = sanitizeBackend(backend, defaultBackend);
+  const effectiveCpuThreads = sanitizeCpuThreads(cpuThreads, maxCores, defaultCpuThreads);
+  const vadCpuThreads = typeof SharedArrayBuffer === 'undefined' ? 1 : DEFAULT_VAD_CPU_THREADS;
   const modelRef = useRef(null);
   const fileInputRef = useRef(null);
   // Ref to access autoTranscribe inside recorder.onstop callback without stale closure
@@ -404,10 +507,9 @@ export default function App() {
   // Recording state
   const [isRecording, setIsRecording] = useState(false);
   const [isVadMonitoring, setIsVadMonitoring] = useState(false);
-  const [vadStatus, setVadStatus] = useState('idle'); // idle|loading|listening|speech|processing|error
+  const [vadStatus, setVadStatus] = useState('idle'); // idle|loading|listening|speech|error
   const [vadSpeechProb, setVadSpeechProb] = useState(0);
   const [vadSegmentCount, setVadSegmentCount] = useState(0);
-  const [vadSegmentsInFlight, setVadSegmentsInFlight] = useState(0);
   const [vadQueueItems, setVadQueueItems] = useState([]);
   const [vadSegmentStartedAt, setVadSegmentStartedAt] = useState(null);
   const [vadSilenceStartedAt, setVadSilenceStartedAt] = useState(null);
@@ -502,13 +604,16 @@ export default function App() {
   };
   const workletNodeRef = useRef(null);   // AudioWorkletNode for cleanup
   const vadLevelMonitorStopRef = useRef(null);
-  const vadSegmentsInFlightRef = useRef(0);
+  const vadSessionRef = useRef(0);
   const vadQueueSeqRef = useRef(0);
   const vadSegmentStartedAtRef = useRef(null);
   const vadSilenceStartedAtRef = useRef(null);
   const vadHandoffPendingRef = useRef(false);
   const vadPlaybackAudioRef = useRef(null);
   const vadQueueItemsRef = useRef([]);
+  const vadQueueAudioRef = useRef(new Map());
+  const vadAsrWorkerClientRef = useRef(null);
+  const vadAsrWorkerConfigRef = useRef(null);
   const [audioLevel, setAudioLevel] = useState(0);
   const [audioContext, setAudioContext] = useState(null);
   const [pendingAudioFile, setPendingAudioFile] = useState(null);
@@ -532,6 +637,77 @@ export default function App() {
       return null;
     });
   }, []);
+  useEffect(() => () => {
+    for (const url of reviewAudioUrlsRef.current.values()) {
+      try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ }
+    }
+    reviewAudioUrlsRef.current.clear();
+  }, []);
+  const createSessionAudioClip = useCallback(({ blob, label, durationSec = null }) => {
+    if (!(blob instanceof Blob)) return null;
+    const clipId = generateSessionId(`clip-${++reviewAudioSeqRef.current}`);
+    const url = URL.createObjectURL(blob);
+    reviewAudioUrlsRef.current.set(clipId, url);
+    return {
+      id: clipId,
+      label: typeof label === 'string' ? label : '',
+      durationSec: typeof durationSec === 'number' ? durationSec : null,
+      url,
+    };
+  }, []);
+  const makeReviewTranscript = useCallback(({
+    id = generateSessionId('trans'),
+    createdAtMs = Date.now(),
+    text: transcriptText = '',
+    filename = '',
+    duration = null,
+    words = [],
+    metrics = null,
+    audioClips = [],
+    source = 'history',
+    mergedCount = null,
+    linkedQueueId = null,
+    confidence = null,
+  }) => ({
+    id,
+    text: typeof transcriptText === 'string' ? transcriptText : '',
+    filename: typeof filename === 'string' ? filename : '',
+    timestamp: new Date(createdAtMs).toLocaleTimeString(),
+    createdAtMs,
+    duration: typeof duration === 'number' ? duration : null,
+    wordCount: Array.isArray(words) && words.length > 0 ? words.length : countWordsFromText(transcriptText),
+    confidence,
+    metrics,
+    words: Array.isArray(words) ? words : [],
+    audioClips: Array.isArray(audioClips) ? audioClips.filter(Boolean) : [],
+    source,
+    mergedCount: Number.isFinite(Number(mergedCount)) ? Number(mergedCount) : null,
+    linkedQueueId: typeof linkedQueueId === 'string' ? linkedQueueId : null,
+  }), []);
+  const addReviewTranscript = useCallback((payload) => {
+    const next = makeReviewTranscript(payload);
+    newestTranscriptionIdRef.current = next.id;
+    setTranscriptions((prev) => [next, ...prev]);
+    return next.id;
+  }, [makeReviewTranscript]);
+  const updateReviewTranscript = useCallback((id, updater) => {
+    let linkedQueueId = null;
+    setTranscriptions((prev) => prev.map((entry) => {
+      if (entry.id !== id) return entry;
+      const nextEntry = typeof updater === 'function'
+        ? updater(entry)
+        : { ...entry, ...updater };
+      linkedQueueId = nextEntry?.linkedQueueId || null;
+      return {
+        ...entry,
+        ...nextEntry,
+        id: entry.id,
+        createdAtMs: entry.createdAtMs,
+        timestamp: entry.timestamp,
+      };
+    }));
+    return linkedQueueId;
+  }, []);
   const clearVadPlayback = useCallback(() => {
     const audio = vadPlaybackAudioRef.current;
     if (audio) {
@@ -550,6 +726,7 @@ export default function App() {
   }, []);
   const clearVadQueueItems = useCallback(() => {
     clearVadPlayback();
+    vadQueueAudioRef.current.clear();
     setVadQueueItems((prev) => {
       releaseVadQueueAudioUrls(prev);
       return [];
@@ -560,6 +737,7 @@ export default function App() {
   }, [vadQueueItems]);
   useEffect(() => () => {
     clearVadPlayback();
+    vadQueueAudioRef.current.clear();
     releaseVadQueueAudioUrls(vadQueueItemsRef.current);
   }, [clearVadPlayback, releaseVadQueueAudioUrls]);
   const toggleVadQueuePlayback = useCallback((itemId) => {
@@ -584,6 +762,25 @@ export default function App() {
       setVadPlayingQueueItemId(null);
     });
   }, [clearVadPlayback, vadPlayingQueueItemId, vadQueueItems]);
+  const ensureVadAsrWorkerClient = useCallback(() => {
+    if (!vadAsrWorkerClientRef.current) {
+      vadAsrWorkerClientRef.current = createVadAsrWorkerClient();
+    }
+    return vadAsrWorkerClientRef.current;
+  }, []);
+  const terminateVadAsrWorker = useCallback(() => {
+    vadAsrWorkerConfigRef.current = null;
+    if (vadAsrWorkerClientRef.current) {
+      vadAsrWorkerClientRef.current.terminate();
+      vadAsrWorkerClientRef.current = null;
+    }
+  }, []);
+  const primeVadAsrWorker = useCallback((config) => {
+    vadAsrWorkerConfigRef.current = config;
+    ensureVadAsrWorkerClient().configure(config, { preload: true }).catch((error) => {
+      console.warn('[VAD] Background ASR worker warmup failed:', error);
+    });
+  }, [ensureVadAsrWorkerClient]);
   useEffect(() => {
     if (!isVadMonitoring) {
       setVadCurrentSegmentElapsedMs(0);
@@ -867,6 +1064,32 @@ export default function App() {
   const [dictationRegexLoaded, setDictationRegexLoaded] = useState(false);
   // Track which transcriptions have had dictation applied (id -> cleaned text)
   const [dictationCache, setDictationCache] = useState({});
+  const invalidateDictationCache = useCallback((ids) => {
+    const idList = Array.isArray(ids) ? ids : [ids];
+    setDictationCache((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of idList) {
+        if (Object.prototype.hasOwnProperty.call(next, id)) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+  useEffect(() => {
+    setSelectedReviewIds((prev) => prev.filter((id) => transcriptions.some((entry) => entry.id === id)));
+  }, [transcriptions]);
+  useEffect(() => {
+    if (editingReviewId && !transcriptions.some((entry) => entry.id === editingReviewId)) {
+      setEditingReviewId(null);
+      setEditingReviewDraft('');
+    }
+    if (pendingDeleteReviewId && !transcriptions.some((entry) => entry.id === pendingDeleteReviewId)) {
+      setPendingDeleteReviewId(null);
+    }
+  }, [editingReviewId, pendingDeleteReviewId, transcriptions]);
 
   // Load settings from IndexedDB on mount
   useEffect(() => {
@@ -904,13 +1127,14 @@ export default function App() {
           savedTranscriptDisplayMode,
           savedLiveTranscriptionEnabled,
           savedLiveContextWindow,
+          savedBackendExplicit,
         ] = await Promise.all([
-          loadSetting('backend', 'wasm'),
+          loadSetting('backend', defaultBackend),
           loadSetting('preprocessor', 'nemo128'),
           loadPersistedTranscripts(),
           loadSetting('verboseLog', false),
           loadSetting('frameStride', 1),
-          loadSetting('cpuThreads', Math.max(1, maxCores - 2)),
+          loadSetting('cpuThreads', defaultCpuThreads),
           loadSetting('noiseSuppression', true),
           loadSetting('echoCancellation', false),
           loadSetting('autoGainControl', true),
@@ -928,14 +1152,25 @@ export default function App() {
           loadSetting('transcriptDisplayMode', 'raw'),
           loadSetting('liveTranscriptionEnabled', false),
           loadSetting('liveContextWindow', 'auto'),
+          loadSetting('backendExplicit', false),
         ]);
 
-        setBackend(savedBackend);
+        setBackend(
+          shouldRollbackLegacyBackend(savedBackend, savedBackendExplicit)
+            ? defaultBackend
+            : sanitizeBackend(savedBackend, defaultBackend)
+        );
+        setBackendExplicit(savedBackendExplicit === true);
         setPreprocessor(savedPreprocessor);
         setTranscriptions(savedTranscriptions.filter(t => t.text && t.text.trim() !== ''));
         setVerboseLog(savedVerboseLog);
         setFrameStride(savedFrameStride);
-        setCpuThreads(savedCpuThreads);
+        const normalizedCpuThreads = sanitizeCpuThreads(savedCpuThreads, maxCores, defaultCpuThreads);
+        setCpuThreads(
+          shouldMigrateLegacyCpuThreads(normalizedCpuThreads, maxCores)
+            ? defaultCpuThreads
+            : normalizedCpuThreads
+        );
         setNoiseSuppression(savedNoiseSuppression);
         setEchoCancellation(savedEchoCancellation);
         setAutoGainControl(savedAutoGainControl);
@@ -966,7 +1201,7 @@ export default function App() {
     }
     
     loadSettings();
-  }, [maxCores]);
+  }, [defaultBackend, defaultCpuThreads, maxCores]);
 
   // Cleanup on component unmount
   useEffect(() => {
@@ -975,12 +1210,13 @@ export default function App() {
         try { vadRef.current.destroy(); } catch (_) { /* ignore */ }
         vadRef.current = null;
       }
+      terminateVadAsrWorker();
       if (modelRef.current) {
         modelRef.current.dispose();
         modelRef.current = null;
       }
     };
-  }, []);
+  }, [terminateVadAsrWorker]);
 
   // Cleanup on page reload/close
   useEffect(() => {
@@ -1227,6 +1463,7 @@ export default function App() {
     if (!settingsLoaded) return;
     saveSetting('backend', backend);
   }, [backend, settingsLoaded]);
+  usePersistedSetting('backendExplicit', backendExplicit, settingsLoaded);
 
   // Save settings to IndexedDB whenever they change (only after initial load).
   // usePersistedSetting (defined at module scope below) is a thin wrapper
@@ -1281,6 +1518,7 @@ export default function App() {
    */
   async function loadModel({ useLocalFallback = forceLocalFallback } = {}) {
     // Clean up existing model first
+    terminateVadAsrWorker();
     if (modelRef.current) {
       console.log('[App] Disposing existing model before loading new one...');
       modelRef.current.dispose();
@@ -1320,23 +1558,26 @@ export default function App() {
       // forces fp32 (~2.4 GB, no int8 support on the GPU EP), while WASM
       // can use the int8 encoder (~600 MB) and stays under Chromium's
       // ~2 GB blob URL fetch limit.
-      const downloadOpts = {
+      const modelDownloadOpts = {
         encoderQuant: 'int8',
         decoderQuant: 'int8',
         preprocessor,
-        backend,
-        progress: progressCallback,
+        backend: effectiveBackend,
       };
       // Operator-level override of the model revision pin. If unset, hub.js
       // falls back to the per-model revision baked into models.js.
       if (CONFIG.VITE_MODEL_REVISION) {
-        downloadOpts.revision = CONFIG.VITE_MODEL_REVISION;
+        modelDownloadOpts.revision = CONFIG.VITE_MODEL_REVISION;
       }
       if (useLocalFallback) {
         // Serve weights from this instance under /models/<repoId>/
-        downloadOpts.localFallbackBaseUrl = '/models';
+        modelDownloadOpts.localFallbackBaseUrl = '/models';
         console.log('[App] Using local fallback for model download');
       }
+      const downloadOpts = {
+        ...modelDownloadOpts,
+        progress: progressCallback,
+      };
       const modelUrls = await getParakeetModel(repoId, downloadOpts);
 
       // Show compiling sessions stage
@@ -1350,9 +1591,9 @@ export default function App() {
       modelRef.current = await ParakeetModel.fromUrls({
         ...modelUrls.urls,
         filenames: modelUrls.filenames,
-        backend,
+        backend: effectiveBackend,
         verbose: verboseLog,
-        cpuThreads,
+        cpuThreads: effectiveCpuThreads,
         preprocessorBackend: modelUrls.preprocessorBackend,
         nMels,
       });
@@ -1361,6 +1602,13 @@ export default function App() {
       setStatus('modelReady');
       setProgressText('');
       setProgressPct(null);
+      primeVadAsrWorker({
+        repoId,
+        backend: effectiveBackend,
+        cpuThreads: effectiveCpuThreads,
+        verbose: verboseLog,
+        downloadOpts: modelDownloadOpts,
+      });
     } catch (e) {
       console.error(e);
       // If HuggingFace is blocked and local fallback is available, retry silently
@@ -1406,72 +1654,75 @@ export default function App() {
     try { await live.stop(); } catch (e) { console.warn('[Live] stop failed:', e); }
   }
 
-  function enqueueVadSegment(audio16k) {
-    if (!(audio16k instanceof Float32Array) || audio16k.length === 0) return;
-    // Ignore ultra-short snippets that can still happen around boundaries.
-    if (audio16k.length < 16000 * 0.30) return;
-    const sequence = ++vadQueueSeqRef.current;
-    const queueId = `vad-${sequence}`;
-    const audioDuration = audio16k.length / 16000;
-    const wavBlob = createWavBlob(audio16k, 16000);
-    const queueAudioUrl = URL.createObjectURL(wavBlob);
-    const previewUrl = URL.createObjectURL(wavBlob);
-    const file = new File([wavBlob], `vad-segment-${Date.now()}.wav`, { type: 'audio/wav' });
-    vadSegmentsInFlightRef.current += 1;
-    setVadSegmentsInFlight(vadSegmentsInFlightRef.current);
-    setVadQueueItems(prev => [...prev, {
-      id: queueId,
-      sequence,
-      durationSec: audioDuration,
-      status: 'queued',
-      audioUrl: queueAudioUrl,
-      transcribeMs: null,
-    }]);
+  function queueVadSegmentTranscription({ queueId }) {
     const run = async () => {
       if (!modelRef.current) return;
+      const sourceAudio = vadQueueAudioRef.current.get(queueId);
+      if (!(sourceAudio instanceof Float32Array) || sourceAudio.length === 0) {
+        throw new Error('Original VAD segment audio is no longer available.');
+      }
       setVadQueueItems(prev => prev.map(item => (
-        item.id === queueId ? { ...item, status: 'processing' } : item
+        item.id === queueId
+          ? { ...item, status: 'processing', failedMessage: null }
+          : item
       )));
-      const safeName = sanitizeDeviceName(file.name, 'vad-segment');
-      setPendingAudioFile(file);
-      setAudioPreviewUrl(previewUrl);
-      setHasBeenTranscribed(false);
-      setAwaitingFinal(true);
-      setIsTranscribing(true);
       try {
-        // Let the "still listening / processing in background" UI paint before
-        // we start the heavy model work for this finished segment.
-        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        const workerConfig = vadAsrWorkerConfigRef.current;
+        if (!workerConfig) {
+          throw new Error('VAD ASR worker is not configured.');
+        }
+        const client = ensureVadAsrWorkerClient();
+        await client.configure(workerConfig);
+        const workerAudio = sourceAudio.slice();
         const transcribeStart = performance.now();
-        const res = await modelRef.current.transcribe(audio16k, 16000, {
-          returnTimestamps: true,
-          returnConfidences: true,
+        const res = await client.transcribe(workerAudio, {
           frameStride,
           temperature,
         });
         const transcribeElapsedMs = performance.now() - transcribeStart;
+        const currentItem = vadQueueItemsRef.current.find((entry) => entry.id === queueId) || null;
+        let reviewEntryId = currentItem?.reviewEntryId || null;
+        if (reviewEntryId) {
+          invalidateDictationCache(reviewEntryId);
+          updateReviewTranscript(reviewEntryId, {
+            text: res.utterance_text,
+            duration: currentItem?.durationSec ?? null,
+            words: res.words || [],
+            metrics: res.metrics || null,
+            audioClips: Array.isArray(currentItem?.reviewAudioClips) ? currentItem.reviewAudioClips : [],
+            source: 'vad',
+            linkedQueueId: queueId,
+            confidence: res.confidence_scores?.token_avg ?? res.confidence_scores?.word_avg ?? null,
+          });
+        } else if (typeof res.utterance_text === 'string' && res.utterance_text.trim() !== '') {
+          reviewEntryId = addReviewTranscript({
+            filename: `${t('vadQueueSegment')} ${currentItem?.sequence ?? ''}`.trim(),
+            text: res.utterance_text,
+            duration: currentItem?.durationSec ?? null,
+            words: res.words || [],
+            metrics: res.metrics || null,
+            audioClips: Array.isArray(currentItem?.reviewAudioClips) ? currentItem.reviewAudioClips : [],
+            source: 'vad',
+            linkedQueueId: queueId,
+            confidence: res.confidence_scores?.token_avg ?? res.confidence_scores?.word_avg ?? null,
+          });
+        }
         setLatestMetrics(res.metrics);
-        const newTranscription = {
-          id: Date.now(),
-          filename: safeName,
-          text: res.utterance_text,
-          timestamp: new Date().toLocaleTimeString(),
-          duration: audioDuration,
-          wordCount: res.words?.length || 0,
-          confidence: res.confidence_scores?.token_avg ?? res.confidence_scores?.word_avg ?? null,
-          metrics: res.metrics,
-          words: res.words || []
-        };
-        newestTranscriptionIdRef.current = newTranscription.id;
-        startTransition(() => {
-          setTranscriptions(prev => [newTranscription, ...prev]);
-          setText(res.utterance_text);
-          setHasBeenTranscribed(true);
-          setVadSegmentCount((n) => n + 1);
-          setVadQueueItems(prev => prev.map(item => (
-            item.id === queueId ? { ...item, status: 'done', transcribeMs: transcribeElapsedMs } : item
-          )));
-        });
+        setText(res.utterance_text);
+        setVadQueueItems(prev => prev.map(item => (
+          item.id === queueId
+            ? {
+                ...item,
+                status: 'done',
+                transcribeMs: transcribeElapsedMs,
+                transcriptText: res.utterance_text,
+                transcriptWords: res.words || [],
+                failedMessage: null,
+                metrics: res.metrics || null,
+                reviewEntryId: reviewEntryId ?? item.reviewEntryId ?? null,
+              }
+            : item
+        )));
         if (autoCopyToClipboard && res.utterance_text) {
           try {
             const textToCopy = transcriptDisplayMode === 'dictation' && dictationRegexRules.length > 0
@@ -1487,10 +1738,14 @@ export default function App() {
       } catch (e) {
         console.error('[VAD] Segment transcription failed:', e);
         setVadQueueItems(prev => prev.map(item => (
-          item.id === queueId ? { ...item, status: 'failed' } : item
+          item.id === queueId
+            ? {
+                ...item,
+                status: 'failed',
+                failedMessage: e?.message || t('failed'),
+              }
+            : item
         )));
-      } finally {
-        setIsTranscribing(false);
       }
     };
     vadSegmentQueueRef.current = vadSegmentQueueRef.current
@@ -1498,11 +1753,6 @@ export default function App() {
       .then(run)
       .catch((e) => console.warn('[VAD] Segment processing failed:', e))
       .finally(() => {
-        vadSegmentsInFlightRef.current = Math.max(0, vadSegmentsInFlightRef.current - 1);
-        setVadSegmentsInFlight(vadSegmentsInFlightRef.current);
-        if (vadSegmentsInFlightRef.current === 0) {
-          setAwaitingFinal(false);
-        }
         if (vadRef.current) {
           setVadStatus((current) => current === 'speech' ? current : 'listening');
           setStatus('vadListening');
@@ -1510,14 +1760,60 @@ export default function App() {
       });
   }
 
+  function retryVadSegment(itemId) {
+    const item = vadQueueItemsRef.current.find((entry) => entry.id === itemId);
+    if (!item || item.status === 'processing') return;
+    setVadQueueItems(prev => prev.map((entry) => (
+      entry.id === itemId
+        ? { ...entry, status: 'queued', failedMessage: null }
+        : entry
+    )));
+    queueVadSegmentTranscription({
+      queueId: item.id,
+    });
+  }
+
+  function enqueueVadSegment(audio16k) {
+    if (!(audio16k instanceof Float32Array) || audio16k.length === 0) return;
+    // Ignore ultra-short snippets that can still happen around boundaries.
+    if (audio16k.length < 16000 * 0.30) return;
+    const sessionId = vadSessionRef.current;
+    const sequence = ++vadQueueSeqRef.current;
+    const queueId = `vad-${sessionId}-${sequence}`;
+    const audioDuration = audio16k.length / 16000;
+    const wavBlob = createWavBlob(audio16k, 16000);
+    const queueAudioUrl = URL.createObjectURL(wavBlob);
+    const reviewClip = createSessionAudioClip({
+      blob: wavBlob,
+      label: `${t('vadQueueSegment')} ${sequence}`,
+      durationSec: audioDuration,
+    });
+    vadQueueAudioRef.current.set(queueId, audio16k.slice());
+    setVadQueueItems(prev => [...prev, {
+      id: queueId,
+      sequence,
+      durationSec: audioDuration,
+      status: 'queued',
+      audioUrl: queueAudioUrl,
+      transcribeMs: null,
+      transcriptText: '',
+      transcriptWords: [],
+      failedMessage: null,
+      metrics: null,
+      reviewAudioClips: reviewClip ? [reviewClip] : [],
+      reviewEntryId: null,
+    }]);
+    setVadSegmentCount((n) => n + 1);
+    queueVadSegmentTranscription({ queueId });
+  }
+
   async function startVadMonitoring() {
-    if (vadRef.current || isRemoteMic || isRecording) return;
+    if (vadRef.current || isRemoteMic || isRecording) return false;
     setVadStatus('loading');
     setStatus('startingRecording');
-    setVadSegmentCount(0);
-    vadSegmentsInFlightRef.current = 0;
-    setVadSegmentsInFlight(0);
+    vadSessionRef.current += 1;
     vadQueueSeqRef.current = 0;
+    setVadSegmentCount(0);
     clearVadQueueItems();
     resetVadCurrentSegmentTracking();
     setVadSpeechProb(0);
@@ -1528,6 +1824,11 @@ export default function App() {
         model: 'v5',
         baseAssetPath: VAD_ASSET_BASE_PATH,
         onnxWASMBasePath: { ...VAD_ORT_WASM_PATHS },
+        ortConfig: (ort) => {
+          ort.env.logLevel = 'error';
+          ort.env.wasm.proxy = false;
+          ort.env.wasm.numThreads = vadCpuThreads;
+        },
         positiveSpeechThreshold: VAD_POSITIVE_SPEECH_THRESHOLD,
         negativeSpeechThreshold: VAD_NEGATIVE_SPEECH_THRESHOLD,
         redemptionMs: VAD_REDEMPTION_MS,
@@ -1600,6 +1901,7 @@ export default function App() {
       setVadStatus('listening');
       setStatus('vadListening');
       console.log('[VAD] Always-on monitoring started');
+      return true;
     } catch (err) {
       console.error('[VAD] Failed to start monitoring:', err);
       setIsRecording(false);
@@ -1607,6 +1909,7 @@ export default function App() {
       setVadStatus('error');
       setStatus('modelReady');
       alert(`Failed to start VAD monitoring: ${err.message}`);
+      return false;
     }
   }
 
@@ -1624,14 +1927,11 @@ export default function App() {
     resetVadCurrentSegmentTracking();
     setVadStatus('idle');
     setVadSpeechProb(0);
-    vadSegmentsInFlightRef.current = 0;
-    setVadSegmentsInFlight(0);
-    clearVadQueueItems();
     setAudioLevel(0);
     setStatus('modelReady');
     try { await vad.pause(); } catch (_) { /* ignore */ }
     try { await vad.destroy(); } catch (_) { /* ignore */ }
-    await vadSegmentQueueRef.current.catch(() => {});
+    void vadSegmentQueueRef.current.catch(() => {});
     console.log('[VAD] Monitoring stopped');
   }
 
@@ -1642,7 +1942,11 @@ export default function App() {
     setRecordingCountdown(1);
     setStatus('startingRecording');
     await new Promise(resolve => setTimeout(resolve, 250));
-    await startVadMonitoring();
+    const started = await startVadMonitoring();
+    if (!started) {
+      setRecordingCountdown(null);
+      return;
+    }
     setRecordingCountdown(0);
     setStatus('recordingStartsNow');
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -1820,6 +2124,16 @@ export default function App() {
     setPendingAudioFile(file);
     const previewUrl = URL.createObjectURL(wavBlob);
     setAudioPreviewUrl(previewUrl);
+    const clip = createSessionAudioClip({
+      blob: wavBlob,
+      label: file.name,
+      durationSec: pcm16k.length / 16000,
+    });
+    pendingReviewContextRef.current = {
+      source: 'recording',
+      durationSec: pcm16k.length / 16000,
+      audioClips: clip ? [clip] : [],
+    };
     setStatus('modelReady');
 
     setHasBeenTranscribed(false);
@@ -1827,7 +2141,7 @@ export default function App() {
     // Auto-transcribe if enabled
     if (autoTranscribeRef.current && modelRef.current) {
       console.log('[Record] Auto-transcribing...');
-      processAudioFile(file).then(() => {
+      processAudioFile(file, pendingReviewContextRef.current).then(() => {
         setHasBeenTranscribed(true);
       });
     }
@@ -2321,13 +2635,23 @@ export default function App() {
     setPendingAudioFile(file);
     const previewUrl = URL.createObjectURL(wavBlob);
     setAudioPreviewUrl(previewUrl);
+    const clip = createSessionAudioClip({
+      blob: wavBlob,
+      label: file.name,
+      durationSec: pcm16k.length / 16000,
+    });
+    pendingReviewContextRef.current = {
+      source: 'remote-mic',
+      durationSec: pcm16k.length / 16000,
+      audioClips: clip ? [clip] : [],
+    };
     setStatus('modelReady');
     setHasBeenTranscribed(false);
 
     // Auto-transcribe if enabled
     if (autoTranscribeRef.current && modelRef.current) {
       console.log('[RemoteMic] Auto-transcribing...');
-      processAudioFile(file).then(() => {
+      processAudioFile(file, pendingReviewContextRef.current).then(() => {
         setHasBeenTranscribed(true);
       });
     }
@@ -2671,7 +2995,7 @@ export default function App() {
     return new Blob([buffer], { type: 'audio/wav' });
   }
 
-  async function processAudioFile(file) {
+  async function processAudioFile(file, reviewContext = pendingReviewContextRef.current) {
     if (!modelRef.current) return alert(t('loadModelFirst'));
     if (!file) return;
 
@@ -2927,17 +3251,16 @@ export default function App() {
 
       setLatestMetrics(res.metrics);
       // Add to transcriptions list
-      const newTranscription = {
-        id: Date.now(),
+      const newTranscription = makeReviewTranscript({
         filename: safeName,
         text: res.utterance_text,
-        timestamp: new Date().toLocaleTimeString(),
-        duration: audioDuration, // original duration (without padding)
-        wordCount: res.words?.length || 0,
+        duration: typeof reviewContext?.durationSec === 'number' ? reviewContext.durationSec : audioDuration,
+        words: res.words || [],
         confidence: res.confidence_scores?.token_avg ?? res.confidence_scores?.word_avg ?? null,
         metrics: res.metrics,
-        words: res.words || [] // Store word-level data with confidence scores
-      };
+        audioClips: Array.isArray(reviewContext?.audioClips) ? reviewContext.audioClips : [],
+        source: reviewContext?.source || 'file',
+      });
 
       newestTranscriptionIdRef.current = newTranscription.id;
       setTranscriptions(prev => [newTranscription, ...prev]);
@@ -3011,6 +3334,7 @@ export default function App() {
   async function transcribeFile(e) {
     const file = e.target.files?.[0];
     if (!file) return;
+    const safeName = sanitizeDeviceName(file.name, 'file');
     
     // Store the file for later transcription
     setPendingAudioFile(file);
@@ -3024,11 +3348,21 @@ export default function App() {
       const resampledBlob = await resampleToPreview(file);
       const previewUrl = URL.createObjectURL(resampledBlob);
       setAudioPreviewUrl(previewUrl);
+      const clip = createSessionAudioClip({ blob: resampledBlob, label: safeName });
+      pendingReviewContextRef.current = {
+        source: 'file',
+        audioClips: clip ? [clip] : [],
+      };
       setStatus('modelReady');
     } catch (err) {
       console.error('[Preview] Failed to process audio:', err);
       // Fallback to original file if processing fails
       setAudioPreviewUrl(URL.createObjectURL(file));
+      const clip = createSessionAudioClip({ blob: file, label: safeName });
+      pendingReviewContextRef.current = {
+        source: 'file',
+        audioClips: clip ? [clip] : [],
+      };
       setStatus('modelReady');
     } finally {
       setIsProcessingPreview(false);
@@ -3041,12 +3375,13 @@ export default function App() {
 
     // Always transcribe uploaded files immediately — unlike recordings,
     // there's no separate trigger to start transcription for file uploads.
-    await processAudioFile(file);
+    await processAudioFile(file, pendingReviewContextRef.current);
     setHasBeenTranscribed(true);
   }
 
   function clearPendingAudio() {
     setPendingAudioFile(null);
+    pendingReviewContextRef.current = null;
     setAudioPreviewUrl(null); // setter revokes the previous blob URL
     setHasBeenTranscribed(false);
     setIsProcessingPreview(false);
@@ -3059,7 +3394,7 @@ export default function App() {
   async function startTranscription() {
     if (!pendingAudioFile) return;
     
-    await processAudioFile(pendingAudioFile);
+    await processAudioFile(pendingAudioFile, pendingReviewContextRef.current);
     
     // Mark as transcribed but keep the audio in the player
     setHasBeenTranscribed(true);
@@ -3067,6 +3402,12 @@ export default function App() {
 
   function clearTranscriptions() {
     setTranscriptions([]);
+    setSelectedReviewIds([]);
+    setEditingReviewId(null);
+    setEditingReviewDraft('');
+    setPendingDeleteReviewId(null);
+    setDictationCache({});
+    clearLinkedQueueReviewEntryIds(vadQueueItemsRef.current.map((item) => item.id));
     setText('');
     // Forget the on-disk copy too. If persistTranscripts is OFF the key
     // may not exist; idbDelete on a missing key is a no-op.
@@ -3143,10 +3484,111 @@ export default function App() {
     }
   }
 
+  function clearLinkedQueueReviewEntryIds(queueIds) {
+    if (!queueIds || queueIds.length === 0) return;
+    const queueIdSet = new Set(queueIds);
+    setVadQueueItems((prev) => prev.map((item) => (
+      queueIdSet.has(item.id)
+        ? { ...item, reviewEntryId: null }
+        : item
+    )));
+  }
+
+  function toggleReviewSelection(id, checked) {
+    setSelectedReviewIds((prev) => (
+      checked
+        ? (prev.includes(id) ? prev : [...prev, id])
+        : prev.filter((entryId) => entryId !== id)
+    ));
+  }
+
+  function beginReviewEdit(transcription) {
+    if (!transcription) return;
+    setPendingDeleteReviewId(null);
+    setEditingReviewId(transcription.id);
+    setEditingReviewDraft(transcription.text || '');
+  }
+
+  function cancelReviewEdit() {
+    setEditingReviewId(null);
+    setEditingReviewDraft('');
+  }
+
+  function commitReviewEdit() {
+    if (!editingReviewId) return;
+    updateTranscriptionText(editingReviewId, editingReviewDraft);
+    setEditingReviewId(null);
+    setEditingReviewDraft('');
+  }
+
+  function toggleReviewDeleteConfirmation(id) {
+    setPendingDeleteReviewId((current) => current === id ? null : id);
+  }
+
+  function updateTranscriptionText(id, nextText) {
+    const current = transcriptions.find((entry) => entry.id === id);
+    if (!current) return;
+    invalidateDictationCache(id);
+    updateReviewTranscript(id, {
+      text: nextText,
+      wordCount: countWordsFromText(nextText),
+      words: [],
+      confidence: null,
+    });
+    if (current.linkedQueueId) {
+      setVadQueueItems((prev) => prev.map((item) => (
+        item.id === current.linkedQueueId
+          ? { ...item, transcriptText: nextText, transcriptWords: [] }
+          : item
+      )));
+    }
+  }
+
   // Remove a single transcription entry from the list
   function deleteTranscription(id) {
+    const current = transcriptions.find((entry) => entry.id === id);
     setTranscriptions(prev => prev.filter(t => t.id !== id));
+    setSelectedReviewIds((prev) => prev.filter((entryId) => entryId !== id));
+    invalidateDictationCache(id);
+    if (copiedHistoryId === id) setCopiedHistoryId(null);
+    if (editingReviewId === id) {
+      setEditingReviewId(null);
+      setEditingReviewDraft('');
+    }
+    if (pendingDeleteReviewId === id) setPendingDeleteReviewId(null);
+    if (current?.linkedQueueId) clearLinkedQueueReviewEntryIds([current.linkedQueueId]);
     setOpenKebabId(null);
+  }
+
+  function mergeSelectedTranscriptions() {
+    if (selectedReviewIds.length < 2) return;
+    const selectedSet = new Set(selectedReviewIds);
+    const selectedEntries = transcriptions.filter((entry) => selectedSet.has(entry.id));
+    if (selectedEntries.length < 2) return;
+    const orderedEntries = [...selectedEntries].reverse();
+    const mergedText = orderedEntries
+      .map((entry) => normalizeMergedTranscriptText(entry.text))
+      .filter(Boolean)
+      .join(' ');
+    const mergedDuration = orderedEntries.reduce((sum, entry) => sum + (entry.duration || 0), 0);
+    const mergedAudioClips = orderedEntries.flatMap((entry) => (
+      Array.isArray(entry.audioClips) ? entry.audioClips : []
+    ));
+    const linkedQueueIds = selectedEntries
+      .map((entry) => entry.linkedQueueId)
+      .filter((value) => typeof value === 'string');
+    const mergedEntry = makeReviewTranscript({
+      text: mergedText,
+      duration: mergedDuration > 0 ? mergedDuration : null,
+      audioClips: mergedAudioClips,
+      source: 'merged',
+      mergedCount: selectedEntries.length,
+    });
+    newestTranscriptionIdRef.current = mergedEntry.id;
+    invalidateDictationCache(selectedReviewIds);
+    setTranscriptions((prev) => [mergedEntry, ...prev.filter((entry) => !selectedSet.has(entry.id))]);
+    setSelectedReviewIds([]);
+    if (linkedQueueIds.length > 0) clearLinkedQueueReviewEntryIds(linkedQueueIds);
   }
 
   // Load dictation regex rules from CSV files served at /dictation-regex/
@@ -3459,6 +3901,22 @@ export default function App() {
     loadModel();
   };
 
+  function getReviewSummary(trans) {
+    const parts = [];
+    if (trans?.timestamp) parts.push(trans.timestamp);
+    if (Number.isFinite(Number(trans?.wordCount))) parts.push(`${trans.wordCount} ${t('reviewWords')}`);
+    if (Number.isFinite(Number(trans?.duration)) && trans.duration > 0) parts.push(formatDuration(trans.duration));
+    if (Number.isFinite(Number(trans?.mergedCount)) && trans.mergedCount > 1) {
+      parts.push(t('reviewMergedCount').replace('{count}', trans.mergedCount));
+    }
+    return parts.join(' · ');
+  }
+
+  function getReviewClipLabel(clip, index) {
+    if (clip?.label) return clip.label;
+    return `${t('reviewClip')} ${index + 1}`;
+  }
+
   return (
     <div className="app">
       {devMode && (
@@ -3498,6 +3956,27 @@ export default function App() {
           )}
           {t('status')}: {t(status) || status}
         </p>
+      </div>
+
+      <div className="app-view-tabs" role="tablist" aria-label={t('reviewNavigation')}>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activePage === 'record'}
+          className={`app-view-tab${activePage === 'record' ? ' active' : ''}`}
+          onClick={() => setActivePage('record')}
+        >
+          {t('recordPage')}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activePage === 'review'}
+          className={`app-view-tab${activePage === 'review' ? ' active' : ''}`}
+          onClick={() => setActivePage('review')}
+        >
+          {t('reviewPage')}
+        </button>
       </div>
 
       {/* About modal */}
@@ -3763,11 +4242,11 @@ export default function App() {
               </span>
               <div className="setting-options">
                 <label className={status === 'modelReady' ? 'disabled-option' : ''}>
-                  <input type="radio" name="backend" value="wasm" checked={backend === 'wasm'} onChange={e => setBackend(e.target.value)} disabled={status === 'modelReady'} />
+                  <input type="radio" name="backend" value="wasm" checked={backend === 'wasm'} onChange={e => { setBackend(e.target.value); setBackendExplicit(true); }} disabled={status === 'modelReady'} />
                   {t('wasmCpu')}
                 </label>
                 <label className={status === 'modelReady' ? 'disabled-option' : ''}>
-                  <input type="radio" name="backend" value="webgpu-hybrid" checked={backend === 'webgpu-hybrid'} onChange={e => setBackend(e.target.value)} disabled={status === 'modelReady'} />
+                  <input type="radio" name="backend" value="webgpu-hybrid" checked={backend === 'webgpu-hybrid'} onChange={e => { setBackend(e.target.value); setBackendExplicit(true); }} disabled={status === 'modelReady'} />
                   {t('webgpu')}
                 </label>
               </div>
@@ -3956,6 +4435,8 @@ export default function App() {
         </div>
       )}
 
+      {activePage === 'record' && (
+      <>
       {/* Load Model button: visible on initial load or after failure, hidden once model is loading/ready */}
       {(status === 'idle' || (status === 'failed' || status === 'transcriptionFailed')) && (
         <>
@@ -4232,7 +4713,7 @@ export default function App() {
         );
       })()}
 
-      {isVadMonitoring && (
+      {(isVadMonitoring || vadQueueItems.length > 0) && (
         <div style={{
           marginTop: '0.5rem',
           padding: '0.6rem 0.75rem',
@@ -4241,8 +4722,7 @@ export default function App() {
           borderRadius: 'var(--radius-sm)',
         }}>
           {(() => {
-            const pendingItems = vadQueueItems.filter((item) => item.status === 'queued' || item.status === 'processing');
-            const completedItems = vadQueueItems.filter((item) => item.status === 'done' || item.status === 'failed');
+            const queueItems = vadQueueItems;
             return (
               <>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -4253,58 +4733,50 @@ export default function App() {
                     {t('vadSpeechProbability')}: {(vadSpeechProb * 100).toFixed(0)}% · {t('vadSegmentsDetected')}: {vadSegmentCount}
                   </div>
                 </div>
-                {pendingItems.length === 0 ? (
+                {queueItems.length === 0 ? (
                   <p style={{ margin: '0.55rem 0 0', fontSize: '0.88em', fontStyle: 'italic', color: 'var(--text-subtle)' }}>
                     {t('vadQueueEmpty')}
                   </p>
                 ) : (
                   <div style={{ display: 'grid', gap: '0.4rem', marginTop: '0.55rem' }}>
-                    {pendingItems.map((item) => (
+                    {queueItems.map((item, index) => {
+                      const displayText = item.transcriptText
+                        ? (transcriptDisplayMode === 'dictation' && dictationRegexRules.length > 0
+                            ? applyDictationRegex(item.transcriptText)
+                            : item.transcriptText)
+                        : '';
+                      const statusLabel = item.status === 'processing'
+                        ? t('vadQueueProcessing')
+                        : item.status === 'queued'
+                          ? t('vadQueueQueued')
+                          : item.status === 'done' && item.transcribeMs !== null
+                            ? t('vadTranscribedIn').replace('{time}', formatDuration(item.transcribeMs / 1000))
+                            : t('failed');
+                      const primaryText = displayText
+                        || (item.status === 'failed'
+                          ? (item.failedMessage ? `${t('failed')}: ${item.failedMessage}` : t('failed'))
+                          : item.status === 'done'
+                            ? t('vadNoTranscript')
+                            : t('vadQueueWaitingDetail'));
+                      return (
                       <div
                         key={item.id}
                         style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: '0.75rem',
+                          display: 'grid',
+                          gap: '0.35rem',
                           padding: '0.45rem 0.55rem',
                           borderRadius: 'var(--radius-sm)',
                           border: '1px solid var(--border)',
-                          background: item.status === 'processing' ? 'var(--warning-soft-bg, rgba(245, 158, 11, 0.12))' : 'var(--info-soft-bg, rgba(59, 130, 246, 0.10))',
+                          background: item.status === 'processing'
+                            ? 'var(--warning-soft-bg, rgba(245, 158, 11, 0.12))'
+                            : item.status === 'queued'
+                              ? 'var(--info-soft-bg, rgba(59, 130, 246, 0.10))'
+                              : item.status === 'failed'
+                                ? 'var(--danger-soft-bg, rgba(239, 68, 68, 0.08))'
+                                : 'var(--surface, rgba(255,255,255,0.6))',
                         }}
                       >
-                        <span style={{ fontSize: '0.86em' }}>
-                          {t('vadQueueSegment')} {item.sequence}
-                        </span>
-                        <span style={{ fontSize: '0.82em', color: 'var(--text-subtle)', marginLeft: 'auto' }}>
-                          {formatDuration(item.durationSec)}
-                        </span>
-                        <span style={{ fontSize: '0.82em', fontWeight: 600 }}>
-                          {item.status === 'processing' ? t('vadQueueProcessing') : t('vadQueueQueued')}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {completedItems.length > 0 && (
-                  <div style={{ marginTop: '0.7rem' }}>
-                    <div style={{ fontSize: '0.82em', fontWeight: 600, color: 'var(--text-subtle)' }}>
-                      {t('vadQueueCompletedLabel')}
-                    </div>
-                    <div style={{ display: 'grid', gap: '0.4rem', marginTop: '0.45rem' }}>
-                      {completedItems.map((item) => (
-                        <div
-                          key={item.id}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '0.55rem',
-                            padding: '0.45rem 0.55rem',
-                            borderRadius: 'var(--radius-sm)',
-                            border: '1px solid var(--border)',
-                            background: 'var(--surface, rgba(255,255,255,0.6))',
-                          }}
-                        >
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.45rem' }}>
                           <button
                             type="button"
                             onClick={() => toggleVadQueuePlayback(item.id)}
@@ -4320,20 +4792,70 @@ export default function App() {
                           >
                             {vadPlayingQueueItemId === item.id ? '⏸' : '▶'}
                           </button>
-                          <span style={{ fontSize: '0.86em' }}>
-                            {t('vadQueueSegment')} {item.sequence}
+                          <button
+                            type="button"
+                            onClick={() => retryVadSegment(item.id)}
+                            disabled={item.status === 'processing'}
+                            title={t('vadRetrySegment')}
+                            aria-label={t('vadRetrySegment')}
+                            style={{
+                              padding: '0.22rem 0.45rem',
+                              borderRadius: '999px',
+                              border: '1px solid var(--border)',
+                              background: 'var(--bg)',
+                              cursor: item.status === 'processing' ? 'default' : 'pointer',
+                              opacity: item.status === 'processing' ? 0.5 : 1,
+                            }}
+                          >
+                            ↻
+                          </button>
+                          <span style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            minWidth: '1.45rem',
+                            height: '1.45rem',
+                            padding: '0 0.35rem',
+                            borderRadius: '999px',
+                            background: 'var(--accent-soft-bg)',
+                            color: 'var(--accent-soft-text)',
+                            border: '1px solid var(--accent-soft-border)',
+                            fontSize: '0.75rem',
+                            fontWeight: 700,
+                            flexShrink: 0,
+                          }}>
+                            {index + 1}
                           </span>
-                          <span style={{ fontSize: '0.82em', color: 'var(--text-subtle)' }}>
-                            {formatDuration(item.durationSec)}
-                          </span>
-                          <span style={{ fontSize: '0.82em', color: 'var(--text-subtle)', marginLeft: 'auto' }}>
-                            {item.status === 'done' && item.transcribeMs !== null
-                              ? t('vadTranscribedIn').replace('{time}', formatDuration(item.transcribeMs / 1000))
-                              : t('failed')}
-                          </span>
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div style={{
+                              fontSize: '0.9em',
+                              lineHeight: 1.35,
+                              whiteSpace: 'pre-wrap',
+                              color: displayText
+                                ? 'var(--text)'
+                                : item.status === 'failed'
+                                  ? 'var(--danger)'
+                                  : 'var(--text-subtle)',
+                              fontStyle: displayText ? 'normal' : 'italic',
+                              overflowWrap: 'anywhere',
+                            }}>
+                              {primaryText}
+                            </div>
+                            <div style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: '0.45rem',
+                              marginTop: '0.2rem',
+                              fontSize: '0.78em',
+                              color: item.status === 'failed' ? 'var(--danger)' : 'var(--text-subtle)',
+                            }}>
+                              <span>{formatDuration(item.durationSec)}</span>
+                              <span>{statusLabel}</span>
+                            </div>
+                          </div>
                         </div>
-                      ))}
-                    </div>
+                      </div>
+                    )})}
                   </div>
                 )}
               </>
@@ -4475,134 +4997,159 @@ export default function App() {
           {t('preprocess')} {latestMetrics.preprocess_ms} ms · {t('encode')} {(latestMetrics.encode_ms / 1000).toFixed(2)} s · {t('decode')} {(latestMetrics.decode_ms / 1000).toFixed(2)} s · {t('tokenize')} {latestMetrics.tokenize_ms} ms
         </div>
       )}
+      </>)}
+      </>)}
 
-      {/* Transcriptions */}
-      {transcriptions.length > 0 && (
-        <div className="history">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1rem 1rem 0.5rem', flexWrap: 'wrap', gap: '0.5rem', borderBottom: '1px solid var(--border)' }}>
-            <h3 style={{ margin: 0 }}>{t('transcriptions')}</h3>
-            <div style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
-              <button
-                onClick={() => setTranscriptDisplayMode('raw')}
-                className={`display-mode-button${transcriptDisplayMode === 'raw' ? ' active' : ''}`}
-                title="Raw transcription"
-              >
-                {t('raw')}
-              </button>
-              <button
-                onClick={() => { setTranscriptDisplayMode('confidence'); setShowConfidenceHeatmap(true); }}
-                className={`display-mode-button${transcriptDisplayMode === 'confidence' ? ' active' : ''}`}
-                title={t('confidence')}
-              >
-                {t('confidence')}
-              </button>
-              {dictationRegexRules.length > 0 && (
-                <button
-                  onClick={() => setTranscriptDisplayMode('dictation')}
-                  className={`display-mode-button${transcriptDisplayMode === 'dictation' ? ' active' : ''}`}
-                  title={`${t('dictationRules')} (${dictationRegexRules.length} ${t('dictationRulesExperimental')})`}
-                >
-                  {t('dictationExp')}
-                </button>
-              )}
+      {activePage === 'review' && (
+        <div className="review-page">
+          <div className="review-page__header">
+            <div>
+              <h3>{t('reviewPage')}</h3>
+              <p>{t('reviewPageHint')}</p>
             </div>
+            <button
+              type="button"
+              className="primary"
+              onClick={mergeSelectedTranscriptions}
+              disabled={selectedReviewIds.length < 2}
+            >
+              {t('reviewMergeSelected')}
+            </button>
           </div>
-          <div>
-            {transcriptions.map((trans) => {
-              // Calculate average and minimum confidence from words
-              const wordConfs = trans.words?.map(w => w.confidence).filter(c => c != null) || [];
-              const avgConf = wordConfs.length > 0 ? wordConfs.reduce((a, b) => a + b, 0) / wordConfs.length : null;
-              const minConf = wordConfs.length > 0 ? Math.min(...wordConfs) : null;
-              
-              return (
-                <div className={`history-item${trans.id === newestTranscriptionIdRef.current ? ' history-item-enter' : ''}`} key={trans.id}>
-                  <div className="history-meta">
-                    <strong>{truncateFilename(trans.filename)}</strong>
-                    {showAdvancedInfo && (
-                      <span style={{ fontSize: '0.85em', color: 'var(--text-subtle)', marginLeft: '0.5rem' }}>
-                        {typeof trans.duration === 'number' && `${formatDuration(trans.duration)} | `}{trans.wordCount} words{trans.metrics && ` | RTF: ${trans.metrics.rtf?.toFixed(2)}x`}
-                        {avgConf !== null && minConf !== null && ` | Avg: ${(avgConf * 100).toFixed(1)}% | Min: ${(minConf * 100).toFixed(1)}%`}
-                      </span>
-                    )}
-                    <span>{trans.timestamp}</span>
-                  </div>
-                  <div className="history-text-container">
-                    <div className="history-text">
-                      {showConfidenceHeatmap && transcriptDisplayMode === 'confidence' && trans.words && trans.words.length > 0 ? (
-                        // Render word-by-word with adaptive confidence heatmap
-                        (() => {
-                          // Calculate min/max confidence for adaptive coloring
-                          const confidences = trans.words.map(w => w.confidence).filter(c => c != null);
-                          const minConf = confidences.length > 0 ? Math.min(...confidences) : 0;
-                          const maxConf = confidences.length > 0 ? Math.max(...confidences) : 1;
 
-                          return trans.words.map((word, i) => (
-                            <span
-                              key={i}
-                              style={{
-                                backgroundColor: getConfidenceColor(word.confidence, minConf, maxConf),
-                                padding: '2px 3px',
-                                borderRadius: '3px',
-                                display: 'inline-block',
-                                marginRight: '0.2em',
-                                transition: 'background-color 0.2s'
-                              }}
-                              title={word.confidence ? `"${word.text}" - Confidence: ${(word.confidence * 100).toFixed(1)}% (Range: ${(minConf * 100).toFixed(1)}%-${(maxConf * 100).toFixed(1)}%)` : word.text}
-                            >
-                              {word.text}
-                            </span>
-                          ));
-                        })()
+          {selectedReviewIds.length > 0 && (
+            <Banner tone="info" style={{ marginBottom: '0.75rem' }}>
+              {t('reviewSelectedCount').replace('{count}', selectedReviewIds.length)}
+            </Banner>
+          )}
+
+          {transcriptions.length === 0 ? (
+            <div className="review-empty-state">
+              <strong>{t('reviewEmptyTitle')}</strong>
+              <p>{t('reviewEmptyBody')}</p>
+            </div>
+          ) : (
+            <div className="review-list">
+              {transcriptions.map((trans, index) => (
+                <div
+                  className={`review-item${trans.id === newestTranscriptionIdRef.current ? ' history-item-enter' : ''}`}
+                  key={trans.id}
+                >
+                  <div className="review-item__header">
+                    <div className="review-item__main">
+                      <input
+                        type="checkbox"
+                        className="review-item__checkbox"
+                        checked={selectedReviewIds.includes(trans.id)}
+                        onChange={(e) => toggleReviewSelection(trans.id, e.target.checked)}
+                      />
+                      <span className="review-item__position">{index + 1}</span>
+                      {editingReviewId === trans.id ? (
+                        <textarea
+                          className="review-item__title-editor"
+                          value={editingReviewDraft}
+                          autoFocus
+                          onChange={(e) => setEditingReviewDraft(e.target.value)}
+                          onBlur={commitReviewEdit}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape') {
+                              e.preventDefault();
+                              cancelReviewEdit();
+                            }
+                            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                              e.preventDefault();
+                              commitReviewEdit();
+                            }
+                          }}
+                          aria-label={t('reviewEditTranscript')}
+                        />
                       ) : (
-                        // Show raw or dictation-cleaned text
-                        <span style={{ whiteSpace: 'pre-wrap' }}>{getDisplayText(trans)}</span>
+                        <button
+                          type="button"
+                          className="review-item__title-button"
+                          onClick={() => beginReviewEdit(trans)}
+                          title={t('reviewEditTranscript')}
+                        >
+                          {getDisplayText(trans) || t('reviewSnippet')}
+                        </button>
                       )}
                     </div>
-                    {/* Confidence score overlay shown when toggled via kebab menu */}
-                    {transcriptDisplayMode === 'confidence' && avgConf !== null && (
-                      <div className="confidence-overlay">
-                        Avg: {(avgConf * 100).toFixed(1)}% &nbsp;|&nbsp; Min: {(minConf * 100).toFixed(1)}%
-                      </div>
-                    )}
-                    {/* Kebab (three-dot) menu for per-entry actions */}
-                    <div className="kebab-menu-wrapper">
+                    <div className="review-item__actions">
                       <button
-                        className="kebab-button"
-                        title={t('moreActions')}
-                        aria-label={t('moreActions')}
-                        disabled={anyModalOpen}
-                        onClick={(e) => { e.stopPropagation(); setOpenKebabId(openKebabId === trans.id ? null : trans.id); }}
+                        type="button"
+                        onClick={() => copyHistoryItem(trans)}
+                        title={copiedHistoryId === trans.id ? t('copied') : t('copyText')}
+                        aria-label={copiedHistoryId === trans.id ? t('copied') : t('copyText')}
                       >
-                        ⋮
+                        {copiedHistoryId === trans.id ? '✓' : '📋'}
                       </button>
-                      {openKebabId === trans.id && (
-                        <div className="kebab-dropdown">
-                          <button onClick={() => { copyHistoryItem(trans); setOpenKebabId(null); }}>
-                            {copiedHistoryId === trans.id ? t('copied') : t('copyText')}
-                          </button>
-                          {dictationRegexRules.length > 0 && (
-                            <button onClick={async () => {
-                              const cleaned = applyDictationRegex(trans.text);
-                              try { await navigator.clipboard.writeText(sanitizeClipboardText(cleaned)); setCopiedHistoryId(trans.id); setTimeout(() => setCopiedHistoryId(null), 2000); } catch (e) { console.error('[Copy] Failed:', e); }
-                              setOpenKebabId(null);
-                            }}>
-                              {t('copyDictation')}
-                            </button>
-                          )}
-                          <button className="kebab-delete" onClick={() => deleteTranscription(trans.id)}>
-                            {t('delete')}
-                          </button>
-                        </div>
+                      {dictationRegexRules.length > 0 && (
+                        <button
+                          type="button"
+                          title={t('copyDictation')}
+                          aria-label={t('copyDictation')}
+                          onClick={async () => {
+                            const cleaned = applyDictationRegex(trans.text);
+                            try {
+                              await navigator.clipboard.writeText(sanitizeClipboardText(cleaned));
+                              setCopiedHistoryId(trans.id);
+                              setTimeout(() => setCopiedHistoryId(null), 2000);
+                            } catch (e) {
+                              console.error('[Copy] Failed:', e);
+                            }
+                          }}
+                        >
+                          ✨
+                        </button>
                       )}
+                      <div className="review-item__delete-group">
+                        <button
+                          type="button"
+                          className="review-item__delete"
+                          onClick={() => toggleReviewDeleteConfirmation(trans.id)}
+                          title={t('delete')}
+                          aria-label={t('delete')}
+                        >
+                          🗑️
+                        </button>
+                        {pendingDeleteReviewId === trans.id && (
+                          <button
+                            type="button"
+                            className="review-item__confirm-delete"
+                            onClick={() => deleteTranscription(trans.id)}
+                          >
+                            {t('reviewConfirmDelete')}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
+
+                  <div className="review-item__summary">{getReviewSummary(trans)}</div>
+
+                  {Array.isArray(trans.audioClips) && trans.audioClips.length > 0 ? (
+                    <div className="review-item__clips">
+                      {trans.audioClips.map((clip, clipIndex) => (
+                        <div className="review-item__clip" key={clip.id || `${trans.id}-clip-${clipIndex}`}>
+                          <span className="review-item__clip-label">
+                            {getReviewClipLabel(clip, clipIndex)}
+                            {Number.isFinite(Number(clip?.durationSec)) && clip.durationSec > 0 && (
+                              <span className="review-item__clip-duration"> · {formatDuration(clip.durationSec)}</span>
+                            )}
+                          </span>
+                          <audio controls preload="none" src={clip.url} />
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="review-item__no-audio">{t('reviewAudioUnavailable')}</div>
+                  )}
                 </div>
-              );
-            })}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
-      </>)}
 
       {/* Fingerprint compare modal: blocks until the user confirms or denies. */}
       {remoteMicFingerprint && remoteMicVerifyResolveRef.current && (
