@@ -10,6 +10,8 @@ import { verifiedAddModule } from './lib/asset-integrity.js';
 import { createLiveTranscriber } from './lib/liveTranscriber.js';
 import { acquireKeepalive, releaseKeepalive } from './lib/keepalive.js';
 import { MicVAD } from '@ricky0123/vad-web';
+import vadOrtWasmThreadedMjsUrl from '../vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs?url';
+import vadOrtWasmThreadedWasmUrl from '../vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm?url';
 import {
     generateKeyPair, exportPublicKey, importPublicKey,
     deriveSharedKey, decrypt
@@ -29,6 +31,15 @@ const devMode = CONFIG.VITE_DEV_MODE === 'true';
 const dictationEnabled = CONFIG.VITE_DICTATION_DEVICE_SUPPORT !== 'false';
 // Lazy-loaded on first use to avoid top-level await issues
 let _dictationLib = null;
+const VAD_ASSET_BASE_PATH = '/vad/';
+const VAD_ORT_WASM_PATHS = {
+  mjs: vadOrtWasmThreadedMjsUrl,
+  wasm: vadOrtWasmThreadedWasmUrl,
+};
+const VAD_POSITIVE_SPEECH_THRESHOLD = 0.3;
+const VAD_NEGATIVE_SPEECH_THRESHOLD = 0.25;
+const VAD_REDEMPTION_MS = 1400;
+const VAD_HANDOFF_PENDING_MS = 100;
 async function getDictationLib() {
   if (!_dictationLib && dictationEnabled) {
     // The vendored dictation_support is a UMD bundle. Vite/Rollup treats it as
@@ -396,6 +407,14 @@ export default function App() {
   const [vadStatus, setVadStatus] = useState('idle'); // idle|loading|listening|speech|processing|error
   const [vadSpeechProb, setVadSpeechProb] = useState(0);
   const [vadSegmentCount, setVadSegmentCount] = useState(0);
+  const [vadSegmentsInFlight, setVadSegmentsInFlight] = useState(0);
+  const [vadQueueItems, setVadQueueItems] = useState([]);
+  const [vadSegmentStartedAt, setVadSegmentStartedAt] = useState(null);
+  const [vadSilenceStartedAt, setVadSilenceStartedAt] = useState(null);
+  const [vadCurrentSegmentElapsedMs, setVadCurrentSegmentElapsedMs] = useState(0);
+  const [vadSilenceRemainingMs, setVadSilenceRemainingMs] = useState(null);
+  const [vadHandoffPending, setVadHandoffPending] = useState(false);
+  const [vadPlayingQueueItemId, setVadPlayingQueueItemId] = useState(null);
   const [isPaused, setIsPaused] = useState(false); // pause/resume support for long recordings
   const [recordingCountdown, setRecordingCountdown] = useState(null);
   const [mediaRecorder, setMediaRecorder] = useState(null); // legacy name kept for stopRecording guard
@@ -482,6 +501,14 @@ export default function App() {
     return out;
   };
   const workletNodeRef = useRef(null);   // AudioWorkletNode for cleanup
+  const vadLevelMonitorStopRef = useRef(null);
+  const vadSegmentsInFlightRef = useRef(0);
+  const vadQueueSeqRef = useRef(0);
+  const vadSegmentStartedAtRef = useRef(null);
+  const vadSilenceStartedAtRef = useRef(null);
+  const vadHandoffPendingRef = useRef(false);
+  const vadPlaybackAudioRef = useRef(null);
+  const vadQueueItemsRef = useRef([]);
   const [audioLevel, setAudioLevel] = useState(0);
   const [audioContext, setAudioContext] = useState(null);
   const [pendingAudioFile, setPendingAudioFile] = useState(null);
@@ -504,6 +531,110 @@ export default function App() {
       }
       return null;
     });
+  }, []);
+  const clearVadPlayback = useCallback(() => {
+    const audio = vadPlaybackAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.src = '';
+      vadPlaybackAudioRef.current = null;
+    }
+    setVadPlayingQueueItemId(null);
+  }, []);
+  const releaseVadQueueAudioUrls = useCallback((items) => {
+    for (const item of items || []) {
+      if (item?.audioUrl) {
+        try { URL.revokeObjectURL(item.audioUrl); } catch (_) { /* ignore */ }
+      }
+    }
+  }, []);
+  const clearVadQueueItems = useCallback(() => {
+    clearVadPlayback();
+    setVadQueueItems((prev) => {
+      releaseVadQueueAudioUrls(prev);
+      return [];
+    });
+  }, [clearVadPlayback, releaseVadQueueAudioUrls]);
+  useEffect(() => {
+    vadQueueItemsRef.current = vadQueueItems;
+  }, [vadQueueItems]);
+  useEffect(() => () => {
+    clearVadPlayback();
+    releaseVadQueueAudioUrls(vadQueueItemsRef.current);
+  }, [clearVadPlayback, releaseVadQueueAudioUrls]);
+  const toggleVadQueuePlayback = useCallback((itemId) => {
+    const item = vadQueueItems.find((entry) => entry.id === itemId);
+    if (!item?.audioUrl) return;
+    if (vadPlayingQueueItemId === itemId && vadPlaybackAudioRef.current) {
+      clearVadPlayback();
+      return;
+    }
+    clearVadPlayback();
+    const audio = new Audio(item.audioUrl);
+    audio.onended = () => setVadPlayingQueueItemId((current) => current === itemId ? null : current);
+    audio.onpause = () => {
+      setVadPlayingQueueItemId((current) => current === itemId ? null : current);
+      if (vadPlaybackAudioRef.current === audio) vadPlaybackAudioRef.current = null;
+    };
+    vadPlaybackAudioRef.current = audio;
+    setVadPlayingQueueItemId(itemId);
+    audio.play().catch((err) => {
+      console.error('[VAD] Failed to play queued segment:', err);
+      if (vadPlaybackAudioRef.current === audio) vadPlaybackAudioRef.current = null;
+      setVadPlayingQueueItemId(null);
+    });
+  }, [clearVadPlayback, vadPlayingQueueItemId, vadQueueItems]);
+  useEffect(() => {
+    if (!isVadMonitoring) {
+      setVadCurrentSegmentElapsedMs(0);
+      setVadSilenceRemainingMs(null);
+      vadHandoffPendingRef.current = false;
+      setVadHandoffPending(false);
+      return;
+    }
+    const tick = () => {
+      const now = Date.now();
+      if (vadSegmentStartedAtRef.current) {
+        setVadCurrentSegmentElapsedMs(now - vadSegmentStartedAtRef.current);
+      } else {
+        setVadCurrentSegmentElapsedMs(0);
+      }
+      if (vadSilenceStartedAtRef.current) {
+        const remainingMs = VAD_REDEMPTION_MS - (now - vadSilenceStartedAtRef.current);
+        if (remainingMs <= VAD_HANDOFF_PENDING_MS) {
+          setVadSilenceRemainingMs(0);
+          if (!vadHandoffPendingRef.current) {
+            vadHandoffPendingRef.current = true;
+            setVadHandoffPending(true);
+          }
+        } else {
+          setVadSilenceRemainingMs(Math.max(0, remainingMs));
+          if (vadHandoffPendingRef.current) {
+            vadHandoffPendingRef.current = false;
+            setVadHandoffPending(false);
+          }
+        }
+      } else {
+        setVadSilenceRemainingMs(null);
+        if (vadHandoffPendingRef.current) {
+          vadHandoffPendingRef.current = false;
+          setVadHandoffPending(false);
+        }
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 100);
+    return () => clearInterval(timer);
+  }, [isVadMonitoring, vadSegmentStartedAt, vadSilenceStartedAt]);
+  const resetVadCurrentSegmentTracking = useCallback(() => {
+    vadSegmentStartedAtRef.current = null;
+    vadSilenceStartedAtRef.current = null;
+    vadHandoffPendingRef.current = false;
+    setVadSegmentStartedAt(null);
+    setVadSilenceStartedAt(null);
+    setVadCurrentSegmentElapsedMs(0);
+    setVadSilenceRemainingMs(null);
+    setVadHandoffPending(false);
   }, []);
   const [isProcessingPreview, setIsProcessingPreview] = useState(false);
   const [hasBeenTranscribed, setHasBeenTranscribed] = useState(false);
@@ -914,7 +1045,11 @@ export default function App() {
   useEffect(() => {
     const handleKeyPress = (e) => {
       // Don't trigger shortcuts if user is typing in an input/textarea
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) {
+        return;
+      }
+      // Never steal browser / OS shortcuts such as Ctrl/Cmd+R refresh.
+      if (e.ctrlKey || e.metaKey || e.altKey) {
         return;
       }
 
@@ -1275,26 +1410,101 @@ export default function App() {
     if (!(audio16k instanceof Float32Array) || audio16k.length === 0) return;
     // Ignore ultra-short snippets that can still happen around boundaries.
     if (audio16k.length < 16000 * 0.30) return;
+    const sequence = ++vadQueueSeqRef.current;
+    const queueId = `vad-${sequence}`;
+    const audioDuration = audio16k.length / 16000;
+    const wavBlob = createWavBlob(audio16k, 16000);
+    const queueAudioUrl = URL.createObjectURL(wavBlob);
+    const previewUrl = URL.createObjectURL(wavBlob);
+    const file = new File([wavBlob], `vad-segment-${Date.now()}.wav`, { type: 'audio/wav' });
+    vadSegmentsInFlightRef.current += 1;
+    setVadSegmentsInFlight(vadSegmentsInFlightRef.current);
+    setVadQueueItems(prev => [...prev, {
+      id: queueId,
+      sequence,
+      durationSec: audioDuration,
+      status: 'queued',
+      audioUrl: queueAudioUrl,
+      transcribeMs: null,
+    }]);
     const run = async () => {
       if (!modelRef.current) return;
-      const wavBlob = createWavBlob(audio16k, 16000);
-      const file = new File([wavBlob], `vad-segment-${Date.now()}.wav`, { type: 'audio/wav' });
+      setVadQueueItems(prev => prev.map(item => (
+        item.id === queueId ? { ...item, status: 'processing' } : item
+      )));
+      const safeName = sanitizeDeviceName(file.name, 'vad-segment');
       setPendingAudioFile(file);
-      setAudioPreviewUrl(URL.createObjectURL(wavBlob));
+      setAudioPreviewUrl(previewUrl);
       setHasBeenTranscribed(false);
       setAwaitingFinal(true);
-      await processAudioFile(file);
-      setHasBeenTranscribed(true);
-      setVadSegmentCount((n) => n + 1);
+      setIsTranscribing(true);
+      try {
+        // Let the "still listening / processing in background" UI paint before
+        // we start the heavy model work for this finished segment.
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        const transcribeStart = performance.now();
+        const res = await modelRef.current.transcribe(audio16k, 16000, {
+          returnTimestamps: true,
+          returnConfidences: true,
+          frameStride,
+          temperature,
+        });
+        const transcribeElapsedMs = performance.now() - transcribeStart;
+        setLatestMetrics(res.metrics);
+        const newTranscription = {
+          id: Date.now(),
+          filename: safeName,
+          text: res.utterance_text,
+          timestamp: new Date().toLocaleTimeString(),
+          duration: audioDuration,
+          wordCount: res.words?.length || 0,
+          confidence: res.confidence_scores?.token_avg ?? res.confidence_scores?.word_avg ?? null,
+          metrics: res.metrics,
+          words: res.words || []
+        };
+        newestTranscriptionIdRef.current = newTranscription.id;
+        startTransition(() => {
+          setTranscriptions(prev => [newTranscription, ...prev]);
+          setText(res.utterance_text);
+          setHasBeenTranscribed(true);
+          setVadSegmentCount((n) => n + 1);
+          setVadQueueItems(prev => prev.map(item => (
+            item.id === queueId ? { ...item, status: 'done', transcribeMs: transcribeElapsedMs } : item
+          )));
+        });
+        if (autoCopyToClipboard && res.utterance_text) {
+          try {
+            const textToCopy = transcriptDisplayMode === 'dictation' && dictationRegexRules.length > 0
+              ? applyDictationRegex(res.utterance_text)
+              : res.utterance_text;
+            await navigator.clipboard.writeText(sanitizeClipboardText(textToCopy));
+            setCopySuccess(true);
+            setTimeout(() => setCopySuccess(false), 2000);
+          } catch (err) {
+            console.error('[VAD] Auto-copy to clipboard failed:', err);
+          }
+        }
+      } catch (e) {
+        console.error('[VAD] Segment transcription failed:', e);
+        setVadQueueItems(prev => prev.map(item => (
+          item.id === queueId ? { ...item, status: 'failed' } : item
+        )));
+      } finally {
+        setIsTranscribing(false);
+      }
     };
     vadSegmentQueueRef.current = vadSegmentQueueRef.current
       .catch(() => {})
       .then(run)
       .catch((e) => console.warn('[VAD] Segment processing failed:', e))
       .finally(() => {
-        setAwaitingFinal(false);
+        vadSegmentsInFlightRef.current = Math.max(0, vadSegmentsInFlightRef.current - 1);
+        setVadSegmentsInFlight(vadSegmentsInFlightRef.current);
+        if (vadSegmentsInFlightRef.current === 0) {
+          setAwaitingFinal(false);
+        }
         if (vadRef.current) {
-          setVadStatus('listening');
+          setVadStatus((current) => current === 'speech' ? current : 'listening');
           setStatus('vadListening');
         }
       });
@@ -1305,12 +1515,22 @@ export default function App() {
     setVadStatus('loading');
     setStatus('startingRecording');
     setVadSegmentCount(0);
+    vadSegmentsInFlightRef.current = 0;
+    setVadSegmentsInFlight(0);
+    vadQueueSeqRef.current = 0;
+    clearVadQueueItems();
+    resetVadCurrentSegmentTracking();
     setVadSpeechProb(0);
     setAudioLevel(0);
     setAwaitingFinal(false);
     try {
       const vad = await MicVAD.new({
         model: 'v5',
+        baseAssetPath: VAD_ASSET_BASE_PATH,
+        onnxWASMBasePath: { ...VAD_ORT_WASM_PATHS },
+        positiveSpeechThreshold: VAD_POSITIVE_SPEECH_THRESHOLD,
+        negativeSpeechThreshold: VAD_NEGATIVE_SPEECH_THRESHOLD,
+        redemptionMs: VAD_REDEMPTION_MS,
         getStream: () => navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
@@ -1321,31 +1541,59 @@ export default function App() {
           },
         }),
         onSpeechStart: () => {
+          const now = Date.now();
+          if (!vadSegmentStartedAtRef.current) {
+            vadSegmentStartedAtRef.current = now;
+            setVadSegmentStartedAt(now);
+          }
+          if (vadSilenceStartedAtRef.current) {
+            vadSilenceStartedAtRef.current = null;
+            setVadSilenceStartedAt(null);
+          }
+          if (vadHandoffPendingRef.current) {
+            vadHandoffPendingRef.current = false;
+            setVadHandoffPending(false);
+          }
           setVadStatus('speech');
           setStatus('vadSpeechDetected');
         },
         onVADMisfire: () => {
+          resetVadCurrentSegmentTracking();
           setVadStatus('listening');
           setStatus('vadListening');
         },
         onSpeechEnd: (audio) => {
-          setVadStatus('processing');
-          setStatus('vadProcessingSegment');
+          resetVadCurrentSegmentTracking();
+          setVadStatus('listening');
+          setStatus('vadListening');
           enqueueVadSegment(audio);
         },
-        onFrameProcessed: (probs, frame) => {
+        onFrameProcessed: (probs) => {
           const p = Number.isFinite(probs?.isSpeech) ? probs.isSpeech : 0;
           setVadSpeechProb(p);
-          if (frame?.length) {
-            let sum = 0;
-            for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
-            const rms = Math.sqrt(sum / frame.length);
-            setAudioLevel(Math.min(100, rms * 250));
+          if (vadSegmentStartedAtRef.current) {
+            if (p < VAD_NEGATIVE_SPEECH_THRESHOLD) {
+              if (!vadSilenceStartedAtRef.current) {
+                const now = Date.now();
+                vadSilenceStartedAtRef.current = now;
+                setVadSilenceStartedAt(now);
+              }
+            } else if (vadSilenceStartedAtRef.current) {
+              vadSilenceStartedAtRef.current = null;
+              setVadSilenceStartedAt(null);
+              if (vadHandoffPendingRef.current) {
+                vadHandoffPendingRef.current = false;
+                setVadHandoffPending(false);
+              }
+            }
           }
         },
       });
       vadRef.current = vad;
       await vad.start();
+      const { audioContext: vadAudioContext, mediaStreamAudioSourceNode } = vad.getAudioInstances();
+      const monitor = createLevelMonitor(vadAudioContext, mediaStreamAudioSourceNode, setAudioLevel);
+      vadLevelMonitorStopRef.current = monitor.stop;
       setIsRecording(true);
       setIsPaused(false);
       setIsVadMonitoring(true);
@@ -1366,11 +1614,19 @@ export default function App() {
     const vad = vadRef.current;
     if (!vad) return;
     vadRef.current = null;
+    if (vadLevelMonitorStopRef.current) {
+      vadLevelMonitorStopRef.current();
+      vadLevelMonitorStopRef.current = null;
+    }
     setIsRecording(false);
     setIsPaused(false);
     setIsVadMonitoring(false);
+    resetVadCurrentSegmentTracking();
     setVadStatus('idle');
     setVadSpeechProb(0);
+    vadSegmentsInFlightRef.current = 0;
+    setVadSegmentsInFlight(0);
+    clearVadQueueItems();
     setAudioLevel(0);
     setStatus('modelReady');
     try { await vad.pause(); } catch (_) { /* ignore */ }
@@ -3876,6 +4132,59 @@ export default function App() {
         const level = isRemoteMic ? remoteMicLevel : audioLevel;
         const paused = isRemoteMic ? remoteMicPaused : isPaused;
         const elapsed = isRemoteMic ? remoteMicElapsed : null;
+        if (isVadMonitoring) {
+          const currentSegmentLabel = vadHandoffPending
+            ? t('vadEndingSegment')
+            : vadSilenceRemainingMs !== null
+            ? t('vadEndingIn').replace('{time}', formatDuration(vadSilenceRemainingMs / 1000))
+            : (vadStatus === 'speech'
+              ? t('vadState_speech')
+              : t('vadListeningForSpeech'));
+          return (
+            <div style={{
+              marginTop: '0.5rem',
+              padding: '0.6rem 0.75rem',
+              background: 'var(--bg-subtle, rgba(0,0,0,0.04))',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-sm)',
+            }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.6rem', justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', minWidth: 0 }}>
+                  <span style={{ fontSize: '0.9em', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                    {t('vadCurrentSegmentLabel')}
+                  </span>
+                  <div style={{
+                    width: '112px',
+                    height: '10px',
+                    background: 'var(--border)',
+                    borderRadius: '999px',
+                    overflow: 'hidden',
+                    flex: '0 0 auto',
+                  }}>
+                    <div style={{
+                      width: `${Math.min(100, level)}%`,
+                      height: '100%',
+                      background: level > 30 ? 'var(--success)' : 'var(--warning)',
+                      transition: 'width 0.1s',
+                    }} />
+                  </div>
+                  <span style={{ fontVariantNumeric: 'tabular-nums', fontSize: '0.9em', whiteSpace: 'nowrap' }}>
+                    {formatTime(Math.floor(vadCurrentSegmentElapsedMs / 1000))}
+                  </span>
+                </div>
+                <div style={{
+                  fontSize: '0.85em',
+                  color: vadSilenceRemainingMs !== null
+                    ? 'var(--warning)'
+                    : 'var(--text-subtle)',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {currentSegmentLabel}
+                </div>
+              </div>
+            </div>
+          );
+        }
         return (
           <div style={{
             marginTop: '0.5rem',
@@ -3924,13 +4233,113 @@ export default function App() {
       })()}
 
       {isVadMonitoring && (
-        <Banner tone={vadStatus === 'speech' ? 'success' : (vadStatus === 'processing' ? 'warning' : 'info')} style={{ marginTop: '0.5rem', justifyContent: 'center' }}>
-          {t('vadStatusLabel')}: {t(`vadState_${vadStatus}`)}
-          {' · '}
-          {t('vadSpeechProbability')}: {(vadSpeechProb * 100).toFixed(0)}%
-          {' · '}
-          {t('vadSegmentsDetected')}: {vadSegmentCount}
-        </Banner>
+        <div style={{
+          marginTop: '0.5rem',
+          padding: '0.6rem 0.75rem',
+          background: 'var(--bg-subtle, rgba(0,0,0,0.04))',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius-sm)',
+        }}>
+          {(() => {
+            const pendingItems = vadQueueItems.filter((item) => item.status === 'queued' || item.status === 'processing');
+            const completedItems = vadQueueItems.filter((item) => item.status === 'done' || item.status === 'failed');
+            return (
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ fontSize: '0.9em', fontWeight: 600 }}>
+                    {t('vadQueueLabel')}
+                  </div>
+                  <div style={{ fontSize: '0.82em', color: 'var(--text-subtle)' }}>
+                    {t('vadSpeechProbability')}: {(vadSpeechProb * 100).toFixed(0)}% · {t('vadSegmentsDetected')}: {vadSegmentCount}
+                  </div>
+                </div>
+                {pendingItems.length === 0 ? (
+                  <p style={{ margin: '0.55rem 0 0', fontSize: '0.88em', fontStyle: 'italic', color: 'var(--text-subtle)' }}>
+                    {t('vadQueueEmpty')}
+                  </p>
+                ) : (
+                  <div style={{ display: 'grid', gap: '0.4rem', marginTop: '0.55rem' }}>
+                    {pendingItems.map((item) => (
+                      <div
+                        key={item.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: '0.75rem',
+                          padding: '0.45rem 0.55rem',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border)',
+                          background: item.status === 'processing' ? 'var(--warning-soft-bg, rgba(245, 158, 11, 0.12))' : 'var(--info-soft-bg, rgba(59, 130, 246, 0.10))',
+                        }}
+                      >
+                        <span style={{ fontSize: '0.86em' }}>
+                          {t('vadQueueSegment')} {item.sequence}
+                        </span>
+                        <span style={{ fontSize: '0.82em', color: 'var(--text-subtle)', marginLeft: 'auto' }}>
+                          {formatDuration(item.durationSec)}
+                        </span>
+                        <span style={{ fontSize: '0.82em', fontWeight: 600 }}>
+                          {item.status === 'processing' ? t('vadQueueProcessing') : t('vadQueueQueued')}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {completedItems.length > 0 && (
+                  <div style={{ marginTop: '0.7rem' }}>
+                    <div style={{ fontSize: '0.82em', fontWeight: 600, color: 'var(--text-subtle)' }}>
+                      {t('vadQueueCompletedLabel')}
+                    </div>
+                    <div style={{ display: 'grid', gap: '0.4rem', marginTop: '0.45rem' }}>
+                      {completedItems.map((item) => (
+                        <div
+                          key={item.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.55rem',
+                            padding: '0.45rem 0.55rem',
+                            borderRadius: 'var(--radius-sm)',
+                            border: '1px solid var(--border)',
+                            background: 'var(--surface, rgba(255,255,255,0.6))',
+                          }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => toggleVadQueuePlayback(item.id)}
+                            disabled={!item.audioUrl}
+                            style={{
+                              padding: '0.22rem 0.45rem',
+                              borderRadius: '999px',
+                              border: '1px solid var(--border)',
+                              background: 'var(--bg)',
+                              cursor: item.audioUrl ? 'pointer' : 'default',
+                            }}
+                            aria-label={vadPlayingQueueItemId === item.id ? t('pause') : t('play')}
+                          >
+                            {vadPlayingQueueItemId === item.id ? '⏸' : '▶'}
+                          </button>
+                          <span style={{ fontSize: '0.86em' }}>
+                            {t('vadQueueSegment')} {item.sequence}
+                          </span>
+                          <span style={{ fontSize: '0.82em', color: 'var(--text-subtle)' }}>
+                            {formatDuration(item.durationSec)}
+                          </span>
+                          <span style={{ fontSize: '0.82em', color: 'var(--text-subtle)', marginLeft: 'auto' }}>
+                            {item.status === 'done' && item.transcribeMs !== null
+                              ? t('vadTranscribedIn').replace('{time}', formatDuration(item.transcribeMs / 1000))
+                              : t('failed')}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
       )}
 
       {/* Live transcript box. Stays mounted across the gap between stop and

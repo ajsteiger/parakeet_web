@@ -105,6 +105,17 @@ async function _verifiedOrtWasmPaths(basePath) {
   return basePath;
 }
 
+async function _devOrtWasmPaths() {
+  const [mjsUrl, wasmUrl] = await Promise.all([
+    import('../ui/vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url'),
+    import('../ui/vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'),
+  ]);
+  return {
+    mjs: mjsUrl.default,
+    wasm: wasmUrl.default,
+  };
+}
+
 /**
  * Initialise ONNX Runtime Web and pick the execution provider.
  * If WebGPU is requested but not supported, we transparently fall back to WASM.
@@ -142,7 +153,11 @@ export async function initOrt({ backend = 'webgpu', wasmPaths, numThreads } = {}
   // before handing bytes to ORT; on success this becomes an object map of
   // blob URLs whose sha384 matched the pin.
   if (!ort.env.wasm.wasmPaths) {
-    ort.env.wasm.wasmPaths = await _verifiedOrtWasmPaths(wasmPaths || '/ort/');
+    if (typeof import.meta !== 'undefined' && import.meta.env?.DEV === true) {
+      ort.env.wasm.wasmPaths = await _devOrtWasmPaths();
+    } else {
+      ort.env.wasm.wasmPaths = await _verifiedOrtWasmPaths(wasmPaths || '/ort/');
+    }
   }
 
   // Configure WASM for better performance

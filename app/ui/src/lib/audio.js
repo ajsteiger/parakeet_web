@@ -31,7 +31,13 @@ export function createLevelMonitor(audioCtx, sourceNode, onLevel) {
     if (running) requestAnimationFrame(tick);
   };
   tick();
-  return { stop: () => { running = false; } };
+  return {
+    stop: () => {
+      running = false;
+      try { sourceNode.disconnect(analyser); } catch (_) { /* ignore */ }
+      try { analyser.disconnect(); } catch (_) { /* ignore */ }
+    }
+  };
 }
 
 /**

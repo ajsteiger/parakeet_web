@@ -37,6 +37,7 @@ const preactCompatClient = path.join(preactDir, 'compat/client.mjs');
 const preactCore     = path.join(preactDir, 'dist/preact.module.js');
 const preactHooks    = path.join(preactDir, 'hooks/dist/hooks.module.js');
 const preactJsxRt    = path.join(preactDir, 'jsx-runtime/dist/jsxRuntime.module.js');
+const preactJsxDevRt = path.join(preactDir, 'compat/jsx-dev-runtime.mjs');
 
 // Use array+regex form so each specifier is matched exactly (the object form
 // does prefix matching, which would make `preact` swallow `preact/hooks`).
@@ -45,10 +46,12 @@ const preactAliases = [
   { find: /^react-dom$/,          replacement: preactCompat },
   { find: /^react-dom\/client$/,  replacement: preactCompatClient },
   { find: /^react\/jsx-runtime$/, replacement: preactJsxRt },
+  { find: /^react\/jsx-dev-runtime$/, replacement: preactJsxDevRt },
   { find: /^preact$/,             replacement: preactCore },
   { find: /^preact\/hooks$/,      replacement: preactHooks },
   { find: /^preact\/compat$/,     replacement: preactCompat },
   { find: /^preact\/jsx-runtime$/, replacement: preactJsxRt },
+  { find: /^preact\/jsx-dev-runtime$/, replacement: preactJsxDevRt },
 ];
 
 export default defineConfig({
