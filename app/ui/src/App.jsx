@@ -9,6 +9,7 @@ import { resamplePcmTo16k, createLevelMonitor } from './lib/audio.js';
 import { verifiedAddModule } from './lib/asset-integrity.js';
 import { createLiveTranscriber } from './lib/liveTranscriber.js';
 import { acquireKeepalive, releaseKeepalive } from './lib/keepalive.js';
+import { MicVAD } from '@ricky0123/vad-web';
 import {
     generateKeyPair, exportPublicKey, importPublicKey,
     deriveSharedKey, decrypt
@@ -391,6 +392,10 @@ export default function App() {
   
   // Recording state
   const [isRecording, setIsRecording] = useState(false);
+  const [isVadMonitoring, setIsVadMonitoring] = useState(false);
+  const [vadStatus, setVadStatus] = useState('idle'); // idle|loading|listening|speech|processing|error
+  const [vadSpeechProb, setVadSpeechProb] = useState(0);
+  const [vadSegmentCount, setVadSegmentCount] = useState(0);
   const [isPaused, setIsPaused] = useState(false); // pause/resume support for long recordings
   const [recordingCountdown, setRecordingCountdown] = useState(null);
   const [mediaRecorder, setMediaRecorder] = useState(null); // legacy name kept for stopRecording guard
@@ -721,6 +726,8 @@ export default function App() {
   // with it as a plain mic, but the physical buttons won't work, so we
   // surface a banner telling them to switch to a Chromium browser.
   const [dictationSuspectedNoWebhid, setDictationSuspectedNoWebhid] = useState(false);
+  const vadRef = useRef(null);
+  const vadSegmentQueueRef = useRef(Promise.resolve());
 
   // Dictation regex post-processing
   // Display mode: 'raw' = plain transcription, 'confidence' = with heatmap, 'dictation' = regex-cleaned
@@ -833,6 +840,10 @@ export default function App() {
   // Cleanup on component unmount
   useEffect(() => {
     return () => {
+      if (vadRef.current) {
+        try { vadRef.current.destroy(); } catch (_) { /* ignore */ }
+        vadRef.current = null;
+      }
       if (modelRef.current) {
         modelRef.current.dispose();
         modelRef.current = null;
@@ -1260,45 +1271,125 @@ export default function App() {
     try { await live.stop(); } catch (e) { console.warn('[Live] stop failed:', e); }
   }
 
-  async function startRecordingCountdown() {
-    // Request microphone access immediately, in parallel with the countdown,
-    // so the stream is ready by the time the countdown ends. This prevents
-    // losing the first words of speech due to getUserMedia latency.
-    const streamPromise = navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        sampleRate: { ideal: 48000 },
-        echoCancellation,
-        noiseSuppression,
-        autoGainControl,
-      }
-    });
+  function enqueueVadSegment(audio16k) {
+    if (!(audio16k instanceof Float32Array) || audio16k.length === 0) return;
+    // Ignore ultra-short snippets that can still happen around boundaries.
+    if (audio16k.length < 16000 * 0.30) return;
+    const run = async () => {
+      if (!modelRef.current) return;
+      const wavBlob = createWavBlob(audio16k, 16000);
+      const file = new File([wavBlob], `vad-segment-${Date.now()}.wav`, { type: 'audio/wav' });
+      setPendingAudioFile(file);
+      setAudioPreviewUrl(URL.createObjectURL(wavBlob));
+      setHasBeenTranscribed(false);
+      setAwaitingFinal(true);
+      await processAudioFile(file);
+      setHasBeenTranscribed(true);
+      setVadSegmentCount((n) => n + 1);
+    };
+    vadSegmentQueueRef.current = vadSegmentQueueRef.current
+      .catch(() => {})
+      .then(run)
+      .catch((e) => console.warn('[VAD] Segment processing failed:', e))
+      .finally(() => {
+        setAwaitingFinal(false);
+        if (vadRef.current) {
+          setVadStatus('listening');
+          setStatus('vadListening');
+        }
+      });
+  }
 
-    // Acquire the stream early so the mic hardware is warm by the time
-    // the countdown finishes. But do NOT start recording yet — we only
-    // want to capture audio from ~100ms before the countdown ends, to
-    // avoid feeding seconds of silence/noise to the model.
-    let stream;
+  async function startVadMonitoring() {
+    if (vadRef.current || isRemoteMic || isRecording) return;
+    setVadStatus('loading');
+    setStatus('startingRecording');
+    setVadSegmentCount(0);
+    setVadSpeechProb(0);
+    setAudioLevel(0);
+    setAwaitingFinal(false);
     try {
-      stream = await streamPromise;
+      const vad = await MicVAD.new({
+        model: 'v5',
+        getStream: () => navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: { ideal: 16000 },
+            echoCancellation,
+            noiseSuppression,
+            autoGainControl,
+          },
+        }),
+        onSpeechStart: () => {
+          setVadStatus('speech');
+          setStatus('vadSpeechDetected');
+        },
+        onVADMisfire: () => {
+          setVadStatus('listening');
+          setStatus('vadListening');
+        },
+        onSpeechEnd: (audio) => {
+          setVadStatus('processing');
+          setStatus('vadProcessingSegment');
+          enqueueVadSegment(audio);
+        },
+        onFrameProcessed: (probs, frame) => {
+          const p = Number.isFinite(probs?.isSpeech) ? probs.isSpeech : 0;
+          setVadSpeechProb(p);
+          if (frame?.length) {
+            let sum = 0;
+            for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+            const rms = Math.sqrt(sum / frame.length);
+            setAudioLevel(Math.min(100, rms * 250));
+          }
+        },
+      });
+      vadRef.current = vad;
+      await vad.start();
+      setIsRecording(true);
+      setIsPaused(false);
+      setIsVadMonitoring(true);
+      setVadStatus('listening');
+      setStatus('vadListening');
+      console.log('[VAD] Always-on monitoring started');
     } catch (err) {
-      console.error('[Record] Failed to access microphone:', err);
-      alert(`Failed to access microphone: ${err.message}\n\nPlease ensure you've granted microphone permissions.`);
-      return;
+      console.error('[VAD] Failed to start monitoring:', err);
+      setIsRecording(false);
+      setIsVadMonitoring(false);
+      setVadStatus('error');
+      setStatus('modelReady');
+      alert(`Failed to start VAD monitoring: ${err.message}`);
     }
+  }
 
-    // Brief delay to let the mic hardware warm up before recording.
-    // Previously a 2s countdown, reduced now that the underlying bug is fixed.
+  async function stopVadMonitoring() {
+    const vad = vadRef.current;
+    if (!vad) return;
+    vadRef.current = null;
+    setIsRecording(false);
+    setIsPaused(false);
+    setIsVadMonitoring(false);
+    setVadStatus('idle');
+    setVadSpeechProb(0);
+    setAudioLevel(0);
+    setStatus('modelReady');
+    try { await vad.pause(); } catch (_) { /* ignore */ }
+    try { await vad.destroy(); } catch (_) { /* ignore */ }
+    await vadSegmentQueueRef.current.catch(() => {});
+    console.log('[VAD] Monitoring stopped');
+  }
+
+  async function startRecordingCountdown() {
+    if (isRemoteMic) return;
+    if (isRecording) return;
+    // Keep the existing visual countdown before entering always-on mode.
     setRecordingCountdown(1);
     setStatus('startingRecording');
-
     await new Promise(resolve => setTimeout(resolve, 250));
-    await startRecordingActual(stream);
-
+    await startVadMonitoring();
     setRecordingCountdown(0);
     setStatus('recordingStartsNow');
-
-    await new Promise(resolve => setTimeout(resolve, 100)); // Brief visual feedback at 0
+    await new Promise(resolve => setTimeout(resolve, 100));
     setRecordingCountdown(null);
   }
 
@@ -1408,6 +1499,10 @@ export default function App() {
     }
 
     if (!isRecording) return;
+    if (isVadMonitoring) {
+      await stopVadMonitoring();
+      return;
+    }
 
     console.log('[Record] Stopping recording...');
     // Flip awaitingFinal first so the live transcript and status banner
@@ -1486,6 +1581,7 @@ export default function App() {
   // audio frames while suspended, so pcmChunksRef accumulation pauses too.
   // The mic stream stays open so resume is instant (no re-negotiation).
   async function pauseRecording() {
+    if (isVadMonitoring) return;
     if (!isRecording || isPaused || !audioContext) return;
     try {
       // Stop level-monitor animation loop while paused
@@ -1503,6 +1599,7 @@ export default function App() {
   // Resume a paused recording by resuming the AudioContext and restarting
   // the level-monitor animation loop.
   async function resumeRecording() {
+    if (isVadMonitoring) return;
     if (!isRecording || !isPaused || !audioContext) return;
     try {
       await audioContext.resume();
@@ -3654,22 +3751,35 @@ export default function App() {
         {/* When recording (local or remote), show Stop + Pause/Resume side by side; otherwise single Record button */}
         {isRecording ? (
           <>
-            <button
-              onClick={stopRecording}
-              className="primary record-button"
-              style={{ background: 'var(--danger)', flex: 1 }}
-              data-umami-event="stop_record_button"
-            >
-              {t('stop')}
-            </button>
-            <button
-              onClick={isPaused ? resumeRecording : pauseRecording}
-              className="primary record-button"
-              style={{ background: isPaused ? 'var(--success)' : 'var(--warning)', flex: 1 }}
-              data-umami-event="pause_record_button"
-            >
-              {isPaused ? t('resume') : t('pause')}
-            </button>
+            {isVadMonitoring ? (
+              <button
+                onClick={stopRecording}
+                className="primary record-button"
+                style={{ background: 'var(--danger)', flex: 1 }}
+                data-umami-event="stop_record_button"
+              >
+                {t('stop')}
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={stopRecording}
+                  className="primary record-button"
+                  style={{ background: 'var(--danger)', flex: 1 }}
+                  data-umami-event="stop_record_button"
+                >
+                  {t('stop')}
+                </button>
+                <button
+                  onClick={isPaused ? resumeRecording : pauseRecording}
+                  className="primary record-button"
+                  style={{ background: isPaused ? 'var(--success)' : 'var(--warning)', flex: 1 }}
+                  data-umami-event="pause_record_button"
+                >
+                  {isPaused ? t('resume') : t('pause')}
+                </button>
+              </>
+            )}
           </>
         ) : isRemoteMic ? (
           <>
@@ -3777,7 +3887,11 @@ export default function App() {
             color: 'var(--danger)'
           }}>
             <span>
-              {paused ? t('recordingPausedMsg') : (isRemoteMic ? (t('remoteMicRecording') || 'Phone recording') : t('recordingInProgress'))}
+              {paused
+                ? t('recordingPausedMsg')
+                : (isRemoteMic
+                  ? (t('remoteMicRecording') || 'Phone recording')
+                  : (isVadMonitoring ? t('vadRecordingInProgress') : t('recordingInProgress')))}
               {isRemoteMic && elapsed !== null && (
                 <span style={{ marginLeft: '0.5rem', fontVariantNumeric: 'tabular-nums' }}>
                   {formatTime(elapsed)}
@@ -3808,6 +3922,16 @@ export default function App() {
           </div>
         );
       })()}
+
+      {isVadMonitoring && (
+        <Banner tone={vadStatus === 'speech' ? 'success' : (vadStatus === 'processing' ? 'warning' : 'info')} style={{ marginTop: '0.5rem', justifyContent: 'center' }}>
+          {t('vadStatusLabel')}: {t(`vadState_${vadStatus}`)}
+          {' · '}
+          {t('vadSpeechProbability')}: {(vadSpeechProb * 100).toFixed(0)}%
+          {' · '}
+          {t('vadSegmentsDetected')}: {vadSegmentCount}
+        </Banner>
+      )}
 
       {/* Live transcript box. Stays mounted across the gap between stop and
           the final ASR result, so the streaming text the user has been

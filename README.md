@@ -37,6 +37,7 @@ Browser-based speech-to-text running entirely client-side using NVIDIA's [Parake
 | 🔒 **100% Private** | Runs entirely in your browser — no audio ever leaves your device |
 | ⚡ **WebGPU Accelerated** | Fast GPU inference with automatic WASM fallback for compatibility |
 | 🎙️ **Phone as Mic** | Use your phone as a wireless microphone via end-to-end encrypted WebRTC |
+| 🗣️ **Silero VAD (Always-on Record)** | Local always-on microphone mode with background voice activity detection: Parakeet is invoked only when speech segments are detected |
 | ⏱️ **Live Transcription** | Optional streaming mode: text appears as you speak, dictation regex applied in real time |
 | 📝 **Dictation Mode** | Post-processes transcriptions with regex rules (medical French vocabulary, punctuation, units) |
 | 🕐 **Word Timestamps** | Per-word timestamps and confidence score heatmap |
@@ -110,6 +111,14 @@ When you hit stop, the canonical full-audio transcription pass runs as it always
 The cadence (how often the live transcript updates) is always auto-adapted: if a transcription pass takes longer than expected, updates back off so the queue never grows. Enable **Display more details** in settings to see the current window size, step interval, and per-tick processing time below the live transcript.
 
 This feature was implemented with [Claude Code](https://www.anthropic.com/claude-code).
+
+## Silero VAD (Always-on Record)
+
+The demo now uses **Silero VAD** in the local microphone flow. Once you click **Record**, the mic stays on and VAD runs continuously in the background:
+
+- When VAD detects speech, it cuts a speech segment and runs Parakeet on that segment.
+- When there is no speech, Parakeet is not invoked.
+- The UI shows live VAD status (listening/speech/processing), speech probability, and how many segments have been transcribed.
 
 ## Remote Microphone (Phone as Mic)
 
@@ -204,4 +213,3 @@ AGPLv3 – See LICENSE file
 ## Credits
 
 This fork is based on **[ysdede/parakeet.js](https://github.com/ysdede/parakeet.js)** – all the heavy lifting and original implementation credit goes there. This would not exist without their excellent work.
-
