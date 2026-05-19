@@ -170,6 +170,40 @@ body {
   flex-shrink: 0;
 }
 
+.app-view-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-subtle);
+}
+
+.app-view-tab {
+  flex: 1;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  padding: 0.7rem 0.9rem;
+  background: transparent;
+  color: var(--text-subtle);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+
+.app-view-tab:hover {
+  background: var(--bg-card);
+  color: var(--text);
+}
+
+.app-view-tab.active {
+  background: var(--bg-card);
+  border-color: var(--accent-soft-border);
+  color: var(--accent-soft-text);
+}
+
 /* ─── Settings toggle button ─────────────────────────────────────────────── */
 .settings-toggle {
   width: 52px;
@@ -662,6 +696,266 @@ button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   word-wrap: break-word;
   overflow-wrap: break-word;
   white-space: normal;
+}
+
+.review-page {
+  margin-bottom: 1rem;
+}
+
+.review-page__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.9rem;
+}
+
+.review-page__header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.review-page__header p {
+  margin: 0.25rem 0 0;
+  color: var(--text-subtle);
+  font-size: 0.9rem;
+}
+
+.review-empty-state {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+}
+
+.review-empty-state strong {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.review-empty-state p {
+  margin: 0;
+  color: var(--text-subtle);
+}
+
+.review-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.review-item {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+}
+
+.review-item__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.review-item__main {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+}
+
+.review-item__checkbox {
+  margin: 0.2rem 0 0;
+  flex-shrink: 0;
+}
+
+.review-item__position {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6rem;
+  height: 1.6rem;
+  padding: 0 0.4rem;
+  border-radius: var(--radius-full);
+  background: var(--accent-soft-bg);
+  color: var(--accent-soft-text);
+  border: 1px solid var(--accent-soft-border);
+  font-size: 0.8rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.review-item__title-text {
+  min-width: 0;
+  font-size: 0.95rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.review-item__title-button {
+  min-width: 0;
+  flex: 1;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.45;
+  text-align: left;
+  cursor: text;
+  overflow-wrap: anywhere;
+}
+
+.review-item__title-button:hover {
+  color: var(--accent-soft-text);
+}
+
+.review-item__title-editor {
+  width: 100%;
+  min-height: 4.5rem;
+  resize: vertical;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+
+.review-item__title-editor:focus {
+  outline: none;
+}
+
+.review-item__summary {
+  margin-bottom: 0.75rem;
+  color: var(--text-subtle);
+  font-size: 0.85rem;
+}
+
+.review-item__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.review-item__actions button {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.35rem 0.45rem;
+  min-width: 2rem;
+}
+
+.review-item__actions button:hover {
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+
+.review-item__actions .review-item__delete {
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.25);
+}
+
+.review-item__actions .review-item__delete:hover {
+  background: var(--danger-soft-bg);
+  border-color: var(--danger);
+}
+
+.review-item__delete-group {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.review-item__confirm-delete {
+  font-size: 0.75rem !important;
+  padding: 0.35rem 0.5rem !important;
+  min-width: 0 !important;
+  color: var(--danger) !important;
+  border-color: rgba(239, 68, 68, 0.35) !important;
+}
+
+.review-item__confirm-delete:hover {
+  background: var(--danger-soft-bg) !important;
+  border-color: var(--danger) !important;
+}
+
+.review-item__clips {
+  display: grid;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+}
+
+.review-item__clip {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.review-item__clip audio {
+  width: min(220px, 100%);
+  height: 32px;
+  margin-top: 0;
+  flex: 0 1 220px;
+}
+
+.review-item__clip-label {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.review-item__clip-duration {
+  color: var(--text-subtle);
+}
+
+.review-item__no-audio {
+  margin-bottom: 0.75rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-subtle);
+  font-size: 0.85rem;
+  background: var(--bg-subtle);
+}
+
+@media (max-width: 640px) {
+  .review-item__header {
+    flex-direction: column;
+  }
+
+  .review-item__actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .review-item__clip {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .review-item__clip audio {
+    width: 100%;
+    flex-basis: auto;
+  }
 }
 
 /* ─── Kebab menu ─────────────────────────────────────────────────────────── */

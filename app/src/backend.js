@@ -105,15 +105,44 @@ async function _verifiedOrtWasmPaths(basePath) {
   return basePath;
 }
 
+async function _devOrtWasmPaths() {
+  const [mjsUrl, wasmUrl] = await Promise.all([
+    import('../ui/vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.mjs?url'),
+    import('../ui/vendor/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url'),
+  ]);
+  return {
+    mjs: mjsUrl.default,
+    wasm: wasmUrl.default,
+  };
+}
+
+function _hardwareConcurrency() {
+  const threads = typeof navigator !== 'undefined' ? Number(navigator.hardwareConcurrency) : NaN;
+  return Number.isFinite(threads) && threads > 0 ? Math.floor(threads) : 4;
+}
+
+function _defaultOrtThreadCount() {
+  return Math.min(4, Math.max(1, _hardwareConcurrency() - 2));
+}
+
+function _resolveOrtThreadCount(numThreads) {
+  const maxThreads = _hardwareConcurrency();
+  const requestedThreads = Number(numThreads);
+  if (!Number.isFinite(requestedThreads)) return _defaultOrtThreadCount();
+  return Math.max(1, Math.min(maxThreads, Math.round(requestedThreads)));
+}
+
 /**
  * Initialise ONNX Runtime Web and pick the execution provider.
  * If WebGPU is requested but not supported, we transparently fall back to WASM.
  * @param {Object} opts
- * @param {('webgpu'|'wasm')} [opts.backend='webgpu'] Desired backend.
+ * @param {('webgpu'|'wasm')} [opts.backend='wasm'] Desired backend.
  * @param {string} [opts.wasmPaths] Optional path prefix for WASM binaries.
+ * @param {number} [opts.numThreads] Optional WASM thread cap. Defaults to a
+ *   local-friendly value (hardwareConcurrency - 2, capped at 4).
  * @returns {Promise<typeof import('onnxruntime-web').default>}
  */
-export async function initOrt({ backend = 'webgpu', wasmPaths, numThreads } = {}) {
+export async function initOrt({ backend = 'wasm', wasmPaths, numThreads } = {}) {
   // Dynamic import to handle Vite bundling issues
   let ort;
   
@@ -142,14 +171,18 @@ export async function initOrt({ backend = 'webgpu', wasmPaths, numThreads } = {}
   // before handing bytes to ORT; on success this becomes an object map of
   // blob URLs whose sha384 matched the pin.
   if (!ort.env.wasm.wasmPaths) {
-    ort.env.wasm.wasmPaths = await _verifiedOrtWasmPaths(wasmPaths || '/ort/');
+    if (typeof import.meta !== 'undefined' && import.meta.env?.DEV === true) {
+      ort.env.wasm.wasmPaths = await _devOrtWasmPaths();
+    } else {
+      ort.env.wasm.wasmPaths = await _verifiedOrtWasmPaths(wasmPaths || '/ort/');
+    }
   }
 
   // Configure WASM for better performance
   if (backend === 'wasm' || backend === 'webgpu') {
     // Enable multi-threading if supported
     if (typeof SharedArrayBuffer !== 'undefined') {
-      ort.env.wasm.numThreads = numThreads || navigator.hardwareConcurrency || 4;
+      ort.env.wasm.numThreads = _resolveOrtThreadCount(numThreads);
       ort.env.wasm.simd = true;
       console.log(`[Parakeet.js] WASM configured with ${ort.env.wasm.numThreads} threads, SIMD enabled`);
     } else {
